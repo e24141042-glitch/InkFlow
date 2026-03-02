@@ -496,8 +496,15 @@ fun InkCanvas(
                 }
 
                 when (activeTool) {
-                    Tool.PEN, Tool.HIGHLIGHTER ->
-                        viewModel.saveStroke(currentPathPoints.toList(), selectedColor, strokeWidth, activeTool)
+                    Tool.PEN, Tool.HIGHLIGHTER -> {
+                        // A single-point tap produces no drag points; duplicate it so
+                        // saveStroke receives ≥2 points and StrokeCap.Round renders a dot.
+                        val pts = if (currentPathPoints.size == 1)
+                            listOf(currentPathPoints[0], currentPathPoints[0])
+                        else
+                            currentPathPoints.toList()
+                        viewModel.saveStroke(pts, selectedColor, strokeWidth, activeTool)
+                    }
                     Tool.LASSO -> {
                         activePath.close()
                         viewModel.selectStrokesInLasso(currentPathPoints.toList())
