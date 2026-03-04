@@ -1,8 +1,10 @@
 package com.vic.inkflow.util
 
+import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.asAndroidPath
 import com.vic.inkflow.data.PointEntity
 import com.vic.inkflow.data.StrokeWithPoints
 import kotlin.math.cos
@@ -13,13 +15,29 @@ import kotlin.math.sqrt
 object IntersectionUtils {
 
     /**
+     * Helper to add thickness to a path.
+     */
+    private fun Path.stroked(width: Float): Path {
+        val paint = Paint().apply {
+            style = Paint.Style.STROKE
+            strokeWidth = width
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+        }
+        val outPath = Path()
+        paint.getFillPath(this, outPath)
+        return outPath
+    }
+
+    /**
      * Eraser: Two-phase collision detection using AABB broad phase + path intersection.
      */
     fun findIntersectingStrokes(eraserPath: Path, strokes: List<StrokeWithPoints>): List<StrokeWithPoints> {
         val intersectingStrokes = mutableListOf<StrokeWithPoints>()
 
+        val strokedEraser = eraserPath.stroked(20f)
         val eraserBounds = RectF()
-        eraserPath.computeBounds(eraserBounds, true)
+        strokedEraser.computeBounds(eraserBounds, true)
 
         for (strokeWithPoints in strokes) {
             val stroke = strokeWithPoints.stroke
@@ -28,10 +46,12 @@ object IntersectionUtils {
             if (RectF.intersects(eraserBounds, strokeBounds)) {
                 val strokePath = if (strokeWithPoints.stroke.shapeType != null)
                     strokeWithPoints.toShapePath()
-                else
-                    strokeWithPoints.points.toPath()
+                else {
+                    val points = strokeWithPoints.points.map { StrokePoint(it.x, it.y, it.width) }
+                    EnvelopeUtils.generateEnvelopePath(points).asAndroidPath()
+                }
                 val intersectionPath = Path()
-                intersectionPath.op(strokePath, eraserPath, Path.Op.INTERSECT)
+                intersectionPath.op(strokePath, strokedEraser, Path.Op.INTERSECT)
 
                 if (!intersectionPath.isEmpty) {
                     intersectingStrokes.add(strokeWithPoints)
@@ -73,20 +93,6 @@ object IntersectionUtils {
             j = i
         }
         return inside
-    }
-
-    private fun List<PointEntity>.toPath(): Path {
-        val path = Path()
-        if (this.size < 2) return path
-
-        path.moveTo(this.first().x, this.first().y)
-        for (i in 1 until this.size) {
-            val p1 = this[i - 1]
-            val p2 = this[i]
-            path.quadTo(p1.x, p1.y, (p1.x + p2.x) / 2, (p1.y + p2.y) / 2)
-        }
-        this.lastOrNull()?.let { path.lineTo(it.x, it.y) }
-        return path
     }
 
     /**

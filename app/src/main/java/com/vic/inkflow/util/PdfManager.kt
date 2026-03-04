@@ -43,6 +43,20 @@ object PdfManager {
             }
         }
 
+    suspend fun copyImageToAppDir(context: Context, sourceUri: Uri): Uri? =
+        withContext(Dispatchers.IO) {
+            try {
+                val dest = File(pdfDir(context), "${UUID.randomUUID()}.jpg")
+                context.contentResolver.openInputStream(sourceUri)?.use { input ->
+                    FileOutputStream(dest).use { output -> input.copyTo(output) }
+                }
+                Uri.fromFile(dest)
+            } catch (e: Exception) {
+                Log.e(TAG, "copyImageToAppDir failed", e)
+                null
+            }
+        }
+
     // ─── 新功能：建立空白 PDF ─────────────────────────────────────────────────
 
     /** 建立一個單頁 A4 空白 PDF，存到 App 私有目錄，回傳 file:// Uri。失敗回傳 null。 */
@@ -63,9 +77,15 @@ object PdfManager {
 
     // ─── 新功能：在現有 PDF 末尾加入空白頁 ───────────────────────────────────
 
-    /** 在 file:// URI 的 PDF 中，於 [afterIndex] 頁之後插入一頁 A4 空白頁。
+    /** 在 file:// URI 的 PDF 中，於 [afterIndex] 頁之後插入一頁空白頁。
+     *  頁面尺寸由 [pageWidthPt] 和 [pageHeightPt] 決定（預設為 A4 直向）。
      *  afterIndex = -1 或超過末頁時，直接追加到最後。 */
-    suspend fun insertBlankPage(fileUri: Uri, afterIndex: Int): Boolean =
+    suspend fun insertBlankPage(
+        fileUri: Uri,
+        afterIndex: Int,
+        pageWidthPt: Float = PDRectangle.A4.width,
+        pageHeightPt: Float = PDRectangle.A4.height
+    ): Boolean =
         withContext(Dispatchers.IO) {
             if (fileUri.scheme != "file") {
                 Log.w(TAG, "insertBlankPage: only file:// URIs are supported")
@@ -74,7 +94,7 @@ object PdfManager {
             try {
                 val file = File(fileUri.path!!)
                 PDDocument.load(file).use { doc ->
-                    val newPage = PDPage(PDRectangle.A4)
+                    val newPage = PDPage(PDRectangle(pageWidthPt, pageHeightPt))
                     val insertBefore = afterIndex + 1
                     if (insertBefore < doc.numberOfPages) {
                         doc.pages.insertBefore(newPage, doc.getPage(insertBefore))
@@ -136,6 +156,28 @@ object PdfManager {
             }
         } catch (e: Exception) {
             Log.e(TAG, "openPdfFileDescriptor failed for $uri", e)
+            null
+        }
+    }
+
+    /**
+     * Reads the width and height (in PDF points) of the first page of the given PDF.
+     * Returns null if the PDF cannot be read.
+     * Must be called on the IO thread.
+     */
+    fun readFirstPageSize(context: Context, uri: Uri): Pair<Float, Float>? {
+        return try {
+            val pfd = openPdfFileDescriptor(context, uri) ?: return null
+            val renderer = PdfRenderer(pfd)
+            val page = renderer.openPage(0)
+            val w = page.width.toFloat()
+            val h = page.height.toFloat()
+            page.close()
+            renderer.close()
+            pfd.close()
+            if (w > 0f && h > 0f) Pair(w, h) else null
+        } catch (e: Exception) {
+            Log.e(TAG, "readFirstPageSize failed for $uri", e)
             null
         }
     }

@@ -33,6 +33,7 @@ class DocumentViewModel(private val documentDao: DocumentDao, private val stroke
             strokeDao.deleteStrokesForDocument(uri)
             db.textAnnotationDao().deleteForDocument(uri)
             db.imageAnnotationDao().deleteForDocument(uri)
+            db.documentPreferenceDao().deleteByDocumentUri(uri)
             // Delete the physical file for app-private documents (file:// URIs).
             try {
                 val parsed = android.net.Uri.parse(uri)

@@ -13,6 +13,7 @@ import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -21,6 +22,9 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -60,12 +64,16 @@ import androidx.compose.material.icons.outlined.LightMode
 import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material.icons.filled.ChevronLeft
 import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.CropSquare
 import androidx.compose.material.icons.filled.Title
+import androidx.compose.material.icons.filled.TouchApp
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Create
+import androidx.compose.material.icons.filled.BackHand
+import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.NoteAdd
 import androidx.compose.material.icons.outlined.FileUpload
@@ -73,6 +81,7 @@ import androidx.compose.material.icons.rounded.Brush
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Gesture
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -86,6 +95,8 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Slider
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.VerticalDivider
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Article
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -130,6 +141,7 @@ import com.vic.inkflow.data.TextAnnotationEntity
 import com.vic.inkflow.util.PdfManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -643,14 +655,22 @@ private fun DocumentCard(
     val context = LocalContext.current
     var coverBitmap by remember(document.uri, document.lastOpenedAt) { mutableStateOf<android.graphics.Bitmap?>(null) }
     LaunchedEffect(document.uri, document.lastOpenedAt) {
+        val cacheKey = "${document.uri}_${document.lastOpenedAt}"
+        val cached = com.vic.inkflow.util.ThumbnailCacheManager.get(cacheKey)
+        if (cached != null) {
+            coverBitmap = cached
+            return@LaunchedEffect
+        }
         val bmp = withContext(Dispatchers.IO) {
             try {
                 val uri = android.net.Uri.parse(document.uri)
-                val pfd = context.contentResolver.openFileDescriptor(uri, "r") ?: return@withContext null
+                val pfd = PdfManager.openPdfFileDescriptor(context, uri) ?: return@withContext null
                 val renderer = android.graphics.pdf.PdfRenderer(pfd)
                 val page = renderer.openPage(0)
-                val bmpW = (page.width * 0.5f).toInt().coerceAtLeast(1)
-                val bmpH = (page.height * 0.5f).toInt().coerceAtLeast(1)
+                val pdfPageW = page.width.toFloat()
+                val pdfPageH = page.height.toFloat()
+                val bmpW = (pdfPageW * 0.5f).toInt().coerceAtLeast(1)
+                val bmpH = (pdfPageH * 0.5f).toInt().coerceAtLeast(1)
                 val bitmap = android.graphics.Bitmap.createBitmap(bmpW, bmpH, android.graphics.Bitmap.Config.ARGB_8888)
                 bitmap.eraseColor(android.graphics.Color.WHITE)
                 try {
@@ -667,8 +687,9 @@ private fun DocumentCard(
                 val imageAnns = db.imageAnnotationDao().getForPage(document.uri, 0).first()
                 val textAnns  = db.textAnnotationDao().getForPage(document.uri, 0).first()
                 val canvas = android.graphics.Canvas(bitmap)
-                val sx = bmpW.toFloat() / EditorViewModel.MODEL_W
-                val sy = bmpH.toFloat() / EditorViewModel.MODEL_H
+                // Use the actual PDF page dimensions as model space (matches EditorViewModel.modelWidth/Height)
+                val sx = bmpW.toFloat() / pdfPageW
+                val sy = bmpH.toFloat() / pdfPageH
 
                 // --- Image annotations (below strokes) ---
                 imageAnns.forEach { ann ->
@@ -765,6 +786,9 @@ private fun DocumentCard(
                     }
                 }
 
+                if (bitmap != null) {
+                    com.vic.inkflow.util.ThumbnailCacheManager.put(cacheKey, bitmap)
+                }
                 bitmap
             } catch (_: Exception) { null }
         }
@@ -894,11 +918,17 @@ enum class SidebarMode { COLLAPSED, NORMAL, FULLSCREEN }
 
 @Composable
 fun TabletEditorScreen(navController: NavController, uri: Uri, db: AppDatabase) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val settingsRepository = remember(db) {
+        EditorSettingsRepository(
+            db = db,
+            documentPreferenceDao = db.documentPreferenceDao()
+        )
+    }
     val viewModel: EditorViewModel = viewModel(
-        factory = EditorViewModelFactory(db, uri.toString())
+        factory = EditorViewModelFactory(db, uri.toString(), settingsRepository)
     )
     val pdfViewModel: PdfViewModel = viewModel()
-    val context = androidx.compose.ui.platform.LocalContext.current
     val strokes by viewModel.currentStrokes.collectAsState()
     val scope = rememberCoroutineScope()
 
@@ -912,18 +942,6 @@ fun TabletEditorScreen(navController: NavController, uri: Uri, db: AppDatabase) 
     // Guards against overwriting the DB value before we've read it on first open
     var initialPageRestored by rememberSaveable { mutableStateOf(false) }
     val sidebarListState = rememberLazyListState()
-
-    val prefs = remember { context.getSharedPreferences("inkflow_settings", 0) }
-    // Restore stroke width from SharedPreferences on first open
-    androidx.compose.runtime.LaunchedEffect(Unit) {
-        val saved = prefs.getFloat("strokeWidth", 5f)
-        viewModel.onStrokeWidthChanged(saved)
-    }
-    // Persist stroke width whenever it changes
-    val strokeWidthForPersist by viewModel.strokeWidth.collectAsState()
-    androidx.compose.runtime.LaunchedEffect(strokeWidthForPersist) {
-        prefs.edit().putFloat("strokeWidth", strokeWidthForPersist).apply()
-    }
 
     // Restore the last-viewed page from DB on first open; rememberSaveable keeps it
     // true across config changes so we don't reset the page on rotation.
@@ -962,6 +980,30 @@ fun TabletEditorScreen(navController: NavController, uri: Uri, db: AppDatabase) 
     }
     val pageCount by pdfViewModel.pageCount.collectAsState()
 
+    // When the PDF first loads, initialize the EditorViewModel's model space to match the first page.
+    val firstPageSize by pdfViewModel.firstPageSize.collectAsState()
+    androidx.compose.runtime.LaunchedEffect(firstPageSize) {
+        firstPageSize?.let { (w, h) -> viewModel.initializePaperSize(w, h) }
+    }
+
+    // Paper style dialog state
+    var showPaperSettingsDialog by remember { mutableStateOf(false) }
+    val paperStyle by viewModel.paperStyle.collectAsState()
+    if (showPaperSettingsDialog) {
+        PaperStyleDialog(
+            currentStyle = paperStyle,
+            hasExistingStrokes = strokes.isNotEmpty(),
+            onDismiss = { showPaperSettingsDialog = false },
+            onConfirm = { newStyle ->
+                viewModel.setPaperStyle(newStyle)
+                showPaperSettingsDialog = false
+            }
+        )
+    }
+
+    // Derive current page aspect ratio from the ViewModel's paper style
+    val pageAspectRatio = paperStyle.aspectRatio
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -992,10 +1034,13 @@ fun TabletEditorScreen(navController: NavController, uri: Uri, db: AppDatabase) 
                         textAnnotations  = allTextAnnotations,
                         imageAnnotations = allImageAnnotations,
                         context          = context,
-                        fileName         = "InkFlow_${System.currentTimeMillis()}.pdf"
+                        fileName         = "InkFlow_${System.currentTimeMillis()}.pdf",
+                        modelW           = viewModel.modelWidth,
+                        modelH           = viewModel.modelHeight
                     )
                 }
-            }
+            },
+            onPaperSettings = { showPaperSettingsDialog = true }
         )
 
         AnimatedVisibility(
@@ -1051,20 +1096,20 @@ fun TabletEditorScreen(navController: NavController, uri: Uri, db: AppDatabase) 
                     scope.launch { pdfViewModel.insertBlankPage(context, afterIndex) }
                 },
                 onDeletePage = { index ->
-                    scope.launch {
-                        withContext(kotlinx.coroutines.Dispatchers.IO) {
-                            db.strokeDao().clearPage(uri.toString(), index)
-                            db.strokeDao().shiftPageIndicesDown(uri.toString(), index)
-                            db.imageAnnotationDao().deleteForPage(uri.toString(), index)
-                            db.imageAnnotationDao().shiftPageIndicesDown(uri.toString(), index)
-                            db.textAnnotationDao().deleteForPage(uri.toString(), index)
-                            db.textAnnotationDao().shiftPageIndicesDown(uri.toString(), index)
-                        }
-                        pdfViewModel.deletePage(index)
+                    // DB 清理與 PDF 刪除平行執行，縮短總等待時間
+                    scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                        db.strokeDao().clearPage(uri.toString(), index)
+                        db.strokeDao().shiftPageIndicesDown(uri.toString(), index)
+                        db.imageAnnotationDao().deleteForPage(uri.toString(), index)
+                        db.imageAnnotationDao().shiftPageIndicesDown(uri.toString(), index)
+                        db.textAnnotationDao().deleteForPage(uri.toString(), index)
+                        db.textAnnotationDao().shiftPageIndicesDown(uri.toString(), index)
                     }
+                    pdfViewModel.deletePage(index)
                 },
                 listState = sidebarListState,
-                modifier = if (isFullscreen) Modifier.fillMaxHeight().weight(1f) else Modifier.fillMaxHeight()
+                modifier = if (isFullscreen) Modifier.fillMaxHeight().weight(1f) else Modifier.fillMaxHeight(),
+                pageAspectRatio = pageAspectRatio
             )
 
             if (!isFullscreen) {
@@ -1073,13 +1118,87 @@ fun TabletEditorScreen(navController: NavController, uri: Uri, db: AppDatabase) 
                         pageIndex = currentPageIndex,
                         pdfViewModel = pdfViewModel,
                         viewModel = viewModel,
-                        modifier = Modifier.fillMaxSize()
+                        modifier = Modifier.fillMaxSize(),
+                        pageAspectRatio = pageAspectRatio
                     )
                     SidebarFloatingControls(
                         sidebarMode = sidebarMode,
                         onModeChange = { sidebarMode = it },
                         modifier = Modifier.align(Alignment.CenterStart).padding(start = 4.dp)
                     )
+                    
+                    // Selected region bubble (Extract button) over Workspace
+                    val lassoPolygon by viewModel.lassoPolygon.collectAsState()
+                    var isExtracting by remember { mutableStateOf(false) }
+
+                    androidx.compose.animation.AnimatedVisibility(
+                        visible = lassoPolygon.isNotEmpty() && !isExtracting,
+                        modifier = Modifier.align(Alignment.TopCenter).padding(top = 16.dp),
+                        enter = fadeIn() + slideInVertically(initialOffsetY = { -it }),
+                        exit = fadeOut() + slideOutVertically(targetOffsetY = { -it })
+                    ) {
+                        Surface(
+                            shape = CircleShape,
+                            color = MaterialTheme.colorScheme.primaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                            shadowElevation = 8.dp
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "已選取區域",
+                                    style = MaterialTheme.typography.labelLarge
+                                )
+                                androidx.compose.material3.TextButton(
+                                    enabled = !isExtracting,
+                                    onClick = {
+                                        if (isExtracting) return@TextButton
+                                        isExtracting = true
+                                        scope.launch {
+                                            try {
+                                                // Snapshot source page first; page index may auto-switch after insertion.
+                                                val sourcePageIndex = currentPageIndex
+                                                val sourceBitmap = kotlinx.coroutines.withTimeoutOrNull(1200) {
+                                                    pdfViewModel.getPageBitmap(sourcePageIndex)
+                                                        .filterNotNull()
+                                                        .first()
+                                                } ?: pdfViewModel.getPageBitmap(sourcePageIndex).value
+
+                                                // Insert blank page right after source page.
+                                                val newPageIndex = sourcePageIndex + 1
+                                                pdfViewModel.insertBlankPage(context, sourcePageIndex)
+
+                                                // Extract source region and place it onto the new page.
+                                                viewModel.extractRegionToNewPage(
+                                                    context = context,
+                                                    sourcePageIndex = sourcePageIndex,
+                                                    targetPageIndex = newPageIndex,
+                                                    pdfPageBitmap = sourceBitmap
+                                                )
+                                            } finally {
+                                                isExtracting = false
+                                            }
+                                        }
+                                    }
+                                ) {
+                                    Text("提取到新頁面")
+                                }
+                                androidx.compose.material3.IconButton(
+                                    onClick = { viewModel.clearSelection() },
+                                    modifier = Modifier.size(24.dp)
+                                ) {
+                                    Icon(
+                                        Icons.Default.Close,
+                                        contentDescription = "取消選取",
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1100,11 +1219,13 @@ private fun Sidebar(
     onAddPage: (afterIndex: Int) -> Unit,
     onDeletePage: (Int) -> Unit,
     listState: LazyListState = rememberLazyListState(),
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    pageAspectRatio: Float = 1f / 1.414f
 ) {
     // Index of the page pending delete confirmation; null = no dialog shown
     var deleteConfirmIndex by remember { mutableStateOf<Int?>(null) }
     val thumbnailVersion by pdfViewModel.thumbnailVersion.collectAsState()
+    val isPageOperationInProgress by pdfViewModel.isPageOperationInProgress.collectAsState()
     if (deleteConfirmIndex != null) {
         val idx = deleteConfirmIndex!!
         androidx.compose.material3.AlertDialog(
@@ -1112,10 +1233,13 @@ private fun Sidebar(
             title = { Text("刪除頁面") },
             text = { Text("確定要刪除第 ${idx + 1} 頁？此操作無法復原。") },
             confirmButton = {
-                androidx.compose.material3.TextButton(onClick = {
-                    deleteConfirmIndex = null
-                    onDeletePage(idx)
-                }) { Text("刪除", color = MaterialTheme.colorScheme.error) }
+                androidx.compose.material3.TextButton(
+                    onClick = {
+                        deleteConfirmIndex = null
+                        onDeletePage(idx)
+                    },
+                    enabled = !isPageOperationInProgress
+                ) { Text("刪除", color = MaterialTheme.colorScheme.error) }
             },
             dismissButton = {
                 androidx.compose.material3.TextButton(onClick = { deleteConfirmIndex = null }) {
@@ -1188,7 +1312,7 @@ private fun Sidebar(
                                 onPageSelected(index)
                                 onModeChange(SidebarMode.NORMAL)
                             },
-                            onLongClick = { if (pageCount > 1) deleteConfirmIndex = index }
+                            onLongClick = { if (pageCount > 1 && !isPageOperationInProgress) deleteConfirmIndex = index }
                         )) {
                             PageThumbnail(
                                 pageIndex = index,
@@ -1197,7 +1321,7 @@ private fun Sidebar(
                                 imageAnnotations = images,
                                 textAnnotations = texts,
                                 isSelected = index == currentPageIndex,
-                                boxModifier = Modifier.fillMaxWidth().aspectRatio(1f / 1.414f)
+                                boxModifier = Modifier.fillMaxWidth().aspectRatio(pageAspectRatio)
                             )
                         }
                     }
@@ -1234,7 +1358,7 @@ private fun Sidebar(
                                 .padding(vertical = 8.dp)
                                 .combinedClickable(
                                     onClick = { onPageSelected(index) },
-                                    onLongClick = { if (pageCount > 1) deleteConfirmIndex = index }
+                                    onLongClick = { if (pageCount > 1 && !isPageOperationInProgress) deleteConfirmIndex = index }
                                 ),
                             contentAlignment = Alignment.Center
                         ) {
@@ -1245,7 +1369,8 @@ private fun Sidebar(
                                     strokes = strokes,
                                     imageAnnotations = images,
                                     textAnnotations = texts,
-                                    isSelected = index == currentPageIndex
+                                    isSelected = index == currentPageIndex,
+                                    boxModifier = Modifier.width(100.dp).aspectRatio(pageAspectRatio)
                                 )
                             } else {
                                 PageIcon(
@@ -1259,8 +1384,15 @@ private fun Sidebar(
                 // 固定在底部的新增頁面按鈕
                 if (sidebarMode == SidebarMode.NORMAL) {
                     androidx.compose.material3.HorizontalDivider()
+                    // 頁面操作進行中時顯示細長進度條，給予使用者視覺回饋
+                    if (isPageOperationInProgress) {
+                        androidx.compose.material3.LinearProgressIndicator(
+                            modifier = Modifier.fillMaxWidth().height(2.dp)
+                        )
+                    }
                     androidx.compose.material3.TextButton(
                         onClick = { onAddPage(currentPageIndex) },
+                        enabled = !isPageOperationInProgress,
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(horizontal = 8.dp, vertical = 6.dp)
@@ -1581,7 +1713,8 @@ private fun Workspace(
     pageIndex: Int,
     pdfViewModel: PdfViewModel,
     viewModel: EditorViewModel,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    pageAspectRatio: Float = 1f / 1.414f
 ) {
     var scale by rememberSaveable { mutableFloatStateOf(1f) }
     var offsetX by rememberSaveable { mutableFloatStateOf(0f) }
@@ -1590,15 +1723,13 @@ private fun Workspace(
     // Track container dimensions (pixels) to compute the fit-to-page minimum scale
     var containerWidth by remember { mutableIntStateOf(0) }
     var containerHeight by remember { mutableIntStateOf(0) }
-    val minScale = remember(containerWidth, containerHeight) {
+    val minScale = remember(containerWidth, containerHeight, pageAspectRatio) {
         if (containerWidth <= 0 || containerHeight <= 0) return@remember 1f
-        // A4 portrait page layout at scale=1 (height-constrained in landscape):
-        //   fillMaxSize(0.9f) + aspectRatio(matchHeightConstraintsFirst=true)
-        //   → pageH = 0.9*cH,  pageW = 0.9*cH / 1.414
         val cW = containerWidth.toFloat()
         val cH = containerHeight.toFloat()
+        // Compute page dimensions (height-constrained for portrait, width-constrained for landscape)
         val pageH = cH * 0.9f
-        val pageW = pageH / 1.414f
+        val pageW = pageH * pageAspectRatio
         // Minimum scale = page occupies 85% of viewport (full page visible with comfortable margins)
         minOf(cW * 0.85f / pageW, cH * 0.85f / pageH)
     }
@@ -1650,7 +1781,7 @@ private fun Workspace(
         Surface(
             modifier = Modifier
                 .fillMaxSize(0.9f)
-                .aspectRatio(1f / 1.414f, matchHeightConstraintsFirst = true)
+                .aspectRatio(pageAspectRatio, matchHeightConstraintsFirst = true)
                 .graphicsLayer(
                     scaleX = scale,
                     scaleY = scale,
@@ -1675,6 +1806,65 @@ private fun Workspace(
                     )
                 }
             }
+            // Background pattern layer (ruled / grid lines)
+            val paperStyle by viewModel.paperStyle.collectAsState()
+            if (paperStyle.background != PageBackground.BLANK) {
+                val lineColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+                androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
+                    val modelW = viewModel.modelWidth
+                    val modelH = viewModel.modelHeight
+                    val sx = size.width / modelW
+                    val sy = size.height / modelH
+                    val step = when (paperStyle.background) {
+                        PageBackground.NARROW_RULED -> 18f  // ~6.35mm
+                        PageBackground.WIDE_RULED   -> 42f  // ~15mm
+                        else                        -> 28f  // ~1cm
+                    }
+                    val drawHLines = paperStyle.background == PageBackground.RULED ||
+                        paperStyle.background == PageBackground.NARROW_RULED ||
+                        paperStyle.background == PageBackground.WIDE_RULED ||
+                        paperStyle.background == PageBackground.GRID
+                    if (drawHLines) {
+                        var y = step
+                        while (y < modelH) {
+                            drawLine(
+                                color = lineColor,
+                                start = androidx.compose.ui.geometry.Offset(0f, y * sy),
+                                end = androidx.compose.ui.geometry.Offset(size.width, y * sy),
+                                strokeWidth = 1f
+                            )
+                            y += step
+                        }
+                    }
+                    if (paperStyle.background == PageBackground.GRID) {
+                        var x = step
+                        while (x < modelW) {
+                            drawLine(
+                                color = lineColor,
+                                start = androidx.compose.ui.geometry.Offset(x * sx, 0f),
+                                end = androidx.compose.ui.geometry.Offset(x * sx, size.height),
+                                strokeWidth = 1f
+                            )
+                            x += step
+                        }
+                    }
+                    if (paperStyle.background == PageBackground.DOT_GRID) {
+                        var y = step
+                        while (y < modelH) {
+                            var x = step
+                            while (x < modelW) {
+                                drawCircle(
+                                    color = lineColor,
+                                    radius = 1.5f,
+                                    center = androidx.compose.ui.geometry.Offset(x * sx, y * sy)
+                                )
+                                x += step
+                            }
+                            y += step
+                        }
+                    }
+                }
+            }
             // Ink active layer (top)
             InkCanvas(
                 modifier = Modifier.fillMaxSize(),
@@ -1693,11 +1883,14 @@ fun TabletEditorTopBar(
     showStrokeWidthSlider: Boolean = false,
     onToggleStrokeWidthSlider: () -> Unit = {},
     onHideStrokeWidthSlider: () -> Unit = {},
-    onExport: () -> Unit = {}
+    onExport: () -> Unit = {},
+    onPaperSettings: () -> Unit = {}
 ) {
     val activeTool by viewModel.selectedTool.collectAsState()
     val selectedColor by viewModel.selectedColor.collectAsState()
+    val recentColors by viewModel.recentColors.collectAsState()
     val toolColors = listOf(Color.Black, Color(0xFF_FFC700), Color(0xFF_F44336), Color(0xFF_4CAF50))
+    val shownRecentColors = recentColors.filterNot { it in toolColors }.take(8)
     var showColorPicker by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
@@ -1738,7 +1931,9 @@ fun TabletEditorTopBar(
 
             // Center Zone
             Row(
-                modifier = Modifier.weight(1f),
+                modifier = Modifier
+                    .weight(1f)
+                    .horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.Center,
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -1793,6 +1988,43 @@ fun TabletEditorTopBar(
                             icon = Icons.Rounded.Gesture,
                             contentDescription = "Lasso Select Tool"
                         )
+                    }
+                }
+
+                // Lasso sub-type pills (visible only when LASSO is active)
+                AnimatedVisibility(
+                    visible = activeTool == Tool.LASSO,
+                    enter = fadeIn(tween(200)) + androidx.compose.animation.expandHorizontally(tween(250, easing = androidx.compose.animation.core.FastOutSlowInEasing)),
+                    exit = fadeOut(tween(180)) + androidx.compose.animation.shrinkHorizontally(tween(200))
+                ) {
+                    val selectedLassoSubType by viewModel.selectedLassoSubType.collectAsState()
+                    Row(
+                        modifier = Modifier
+                            .padding(horizontal = 4.dp)
+                            .background(MaterialTheme.colorScheme.surfaceVariant, shape = MaterialTheme.shapes.medium)
+                            .padding(horizontal = 4.dp, vertical = 2.dp),
+                        horizontalArrangement = Arrangement.spacedBy(2.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        LassoSubType.entries.forEach { subType ->
+                            val isSelected = selectedLassoSubType == subType
+                            TextButton(
+                                onClick = { viewModel.onLassoSubTypeSelected(subType) },
+                                modifier = Modifier.height(32.dp),
+                                colors = androidx.compose.material3.ButtonDefaults.textButtonColors(
+                                    containerColor = if (isSelected) MaterialTheme.colorScheme.primaryContainer else Color.Transparent,
+                                    contentColor   = if (isSelected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface
+                                )
+                            ) {
+                                Text(
+                                    text = when (subType) {
+                                        LassoSubType.FREEFORM -> "隨機圖形"
+                                        LassoSubType.RECT     -> "方形"
+                                    },
+                                    style = MaterialTheme.typography.labelMedium
+                                )
+                            }
+                        }
                     }
                 }
 
@@ -1883,6 +2115,16 @@ fun TabletEditorTopBar(
 
                 VerticalDivider(Modifier.height(28.dp).padding(horizontal = 6.dp))
 
+                // Recent colors (persisted)
+                shownRecentColors.forEach { color ->
+                    ColorChip(color = color, isSelected = selectedColor == color) {
+                        viewModel.onColorSelected(color)
+                    }
+                }
+                if (shownRecentColors.isNotEmpty()) {
+                    VerticalDivider(Modifier.height(28.dp).padding(horizontal = 6.dp))
+                }
+
                 // Color chips
                 toolColors.forEach { color ->
                     ColorChip(color = color, isSelected = selectedColor == color) {
@@ -1941,9 +2183,161 @@ fun TabletEditorTopBar(
                 IconButton(onClick = onExport) {
                     Icon(Icons.Outlined.FileUpload, contentDescription = "Export PDF")
                 }
+
+                // Paper style settings button
+                val paperStyle by viewModel.paperStyle.collectAsState()
+                IconButton(onClick = onPaperSettings) {
+                    Icon(
+                        imageVector = Icons.Default.Article,
+                        contentDescription = "Paper Settings",
+                        tint = if (paperStyle.background != PageBackground.BLANK)
+                            MaterialTheme.colorScheme.primary
+                        else
+                            MaterialTheme.colorScheme.onSurface
+                    )
+                }
+
+                val inputMode by viewModel.inputMode.collectAsState()
+                IconButton(onClick = { viewModel.cycleInputMode() }) {
+                    Icon(
+                        imageVector = when (inputMode) {
+                            InputMode.FREE -> Icons.Filled.TouchApp
+                            InputMode.PALM_REJECTION -> Icons.Filled.BackHand
+                            InputMode.STYLUS_ONLY -> Icons.Filled.Create
+                        },
+                        contentDescription = when (inputMode) {
+                            InputMode.FREE -> "Free (no filter)"
+                            InputMode.PALM_REJECTION -> "Palm Rejection"
+                            InputMode.STYLUS_ONLY -> "Stylus Only"
+                        },
+                        tint = when (inputMode) {
+                            InputMode.FREE -> MaterialTheme.colorScheme.onSurface
+                            InputMode.PALM_REJECTION -> MaterialTheme.colorScheme.tertiary
+                            InputMode.STYLUS_ONLY -> MaterialTheme.colorScheme.primary
+                        }
+                    )
+                }
             }
         }
     }
+}
+
+@Composable
+private fun PaperStyleDialog(
+    currentStyle: PaperStyle,
+    hasExistingStrokes: Boolean,
+    onDismiss: () -> Unit,
+    onConfirm: (PaperStyle) -> Unit
+) {
+    var selectedWidth by remember { mutableFloatStateOf(currentStyle.widthPt) }
+    var selectedHeight by remember { mutableFloatStateOf(currentStyle.heightPt) }
+    var selectedBackground by remember { mutableStateOf(currentStyle.background) }
+    var showSizeWarning by remember { mutableStateOf(false) }
+
+    // Secondary confirmation when a size change would shift existing strokes
+    if (showSizeWarning) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { showSizeWarning = false },
+            title = { Text("確認切換紙張大小") },
+            text = { Text("切換紙張大小後，本頁現有筆劃的位置將會偏移，此操作無法還原。\n確定要繼續嗎？") },
+            confirmButton = {
+                androidx.compose.material3.TextButton(onClick = {
+                    showSizeWarning = false
+                    onConfirm(PaperStyle(selectedWidth, selectedHeight, selectedBackground))
+                }) { Text("繼續") }
+            },
+            dismissButton = {
+                androidx.compose.material3.TextButton(onClick = { showSizeWarning = false }) { Text("取消") }
+            }
+        )
+    }
+
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("紙張樣式設定") },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                // ── Paper size ────────────────────────────────────────────────────────────────────
+                Text("\u7d19\u5f35\u5927\u5c0f", style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.primary)
+                val paperPresets = remember {
+                    listOf(
+                        Triple("A3",     842f,  1191f),
+                        Triple("A4",     595f,   842f),
+                        Triple("A5",     420f,   595f),
+                        Triple("B5",     499f,   709f),
+                        Triple("Letter", 612f,   792f),
+                    )
+                }
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    paperPresets.forEach { (label, w, h) ->
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            val isPortrait  = selectedWidth == w && selectedHeight == h
+                            val isLandscape = selectedWidth == h && selectedHeight == w
+                            FilterChip(
+                                selected = isPortrait,
+                                onClick = { selectedWidth = w; selectedHeight = h },
+                                label = { Text("$label \u76f4\u5411") },
+                                leadingIcon = if (isPortrait) {
+                                    { Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(16.dp)) }
+                                } else null
+                            )
+                            FilterChip(
+                                selected = isLandscape,
+                                onClick = { selectedWidth = h; selectedHeight = w },
+                                label = { Text("$label \u6a6b\u5411") },
+                                leadingIcon = if (isLandscape) {
+                                    { Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(16.dp)) }
+                                } else null
+                            )
+                        }
+                    }
+                }
+                // ── Page background ──────────────────────────────────────────────────────────
+                Text("\u9801\u9762\u80cc\u666f", style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.primary)
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    val bgOptions = listOf(
+                        PageBackground.BLANK        to "\u7a7a\u767d",
+                        PageBackground.RULED        to "\u6a6b\u7dda",
+                        PageBackground.NARROW_RULED to "\u5bc6\u884c",
+                        PageBackground.WIDE_RULED   to "\u5bec\u884c",
+                        PageBackground.GRID         to "\u65b9\u683c",
+                        PageBackground.DOT_GRID     to "\u9ede\u683c",
+                    )
+                    bgOptions.forEach { (bg, label) ->
+                        FilterChip(
+                            selected = selectedBackground == bg,
+                            onClick = { selectedBackground = bg },
+                            label = { Text(label) },
+                            leadingIcon = if (selectedBackground == bg) {
+                                { Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(16.dp)) }
+                            } else null
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            androidx.compose.material3.TextButton(onClick = {
+                val sizeChanged = selectedWidth != currentStyle.widthPt || selectedHeight != currentStyle.heightPt
+                if (sizeChanged && hasExistingStrokes) {
+                    showSizeWarning = true
+                } else {
+                    onConfirm(PaperStyle(selectedWidth, selectedHeight, selectedBackground))
+                }
+            }) { Text("確認") }
+        },
+        dismissButton = {
+            androidx.compose.material3.TextButton(onClick = onDismiss) { Text("取消") }
+        }
+    )
 }
 
 // 新增: 顏色選擇的 Chip 元件，帶有選擇狀態

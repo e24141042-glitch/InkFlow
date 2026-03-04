@@ -46,7 +46,9 @@ object PdfExporter {
         textAnnotations: List<TextAnnotationEntity> = emptyList(),
         imageAnnotations: List<ImageAnnotationEntity> = emptyList(),
         context: Context,
-        fileName: String = "InkFlow_Export.pdf"
+        fileName: String = "InkFlow_Export.pdf",
+        modelW: Float = MODEL_W,
+        modelH: Float = MODEL_H
     ) {
         withContext(Dispatchers.IO) {
             try {
@@ -88,9 +90,9 @@ object PdfExporter {
 
                             pageStrokes?.forEach { stroke ->
                                 if (stroke.stroke.shapeType != null) {
-                                    drawShape(contentStream, stroke, pageWidth, pageHeight)
+                                    drawShape(contentStream, stroke, pageWidth, pageHeight, modelW, modelH)
                                 } else {
-                                    drawStroke(contentStream, stroke, pageWidth, pageHeight)
+                                    drawStroke(contentStream, stroke, pageWidth, pageHeight, modelW, modelH)
                                 }
                             }
 
@@ -127,13 +129,13 @@ object PdfExporter {
         }
     }
 
-    private fun drawStroke(stream: PDPageContentStream, stroke: StrokeWithPoints, pageWidth: Float, pageHeight: Float) {
+    private fun drawStroke(stream: PDPageContentStream, stroke: StrokeWithPoints, pageWidth: Float, pageHeight: Float, modelW: Float = MODEL_W, modelH: Float = MODEL_H) {
         val points = stroke.points.map { PointF(it.x, it.y) }
         if (points.size < 2) return
 
         // Fix #1: scale model-space coords to actual PDF page dimensions.
-        val ratioX = pageWidth  / MODEL_W
-        val ratioY = pageHeight / MODEL_H
+        val ratioX = pageWidth  / modelW
+        val ratioY = pageHeight / modelH
 
         val color = android.graphics.Color.valueOf(stroke.stroke.color)
         // Fix #2 + #5: apply stroke alpha; highlighters get 40% opacity.
@@ -170,10 +172,10 @@ object PdfExporter {
         stream.restoreGraphicsState()
     }
 
-    private fun drawShape(stream: PDPageContentStream, stroke: StrokeWithPoints, pageWidth: Float, pageHeight: Float) {
+    private fun drawShape(stream: PDPageContentStream, stroke: StrokeWithPoints, pageWidth: Float, pageHeight: Float, modelW: Float = MODEL_W, modelH: Float = MODEL_H) {
         // Fix #1: scale model-space bounds to actual PDF page dimensions.
-        val ratioX = pageWidth  / MODEL_W
-        val ratioY = pageHeight / MODEL_H
+        val ratioX = pageWidth  / modelW
+        val ratioY = pageHeight / modelH
 
         val color = android.graphics.Color.valueOf(stroke.stroke.color)
         // Fix #2 + #5: apply stroke alpha.

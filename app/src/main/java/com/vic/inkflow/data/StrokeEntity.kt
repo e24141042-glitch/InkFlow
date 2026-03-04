@@ -61,7 +61,8 @@ data class PointEntity(
     val id: Long = 0,
     val strokeId: String,
     val x: Float,
-    val y: Float
+    val y: Float,
+    val width: Float = 0f  // Added for dynamic stroke thickness based on velocity
 )
 
 /**
