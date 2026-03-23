@@ -1596,38 +1596,6 @@ fun TabletEditorScreen(navController: NavController, uri: Uri, db: AppDatabase) 
                                 ) {
                                     Text("AI 解析")
                                 }
-                                TextButton(
-                                    onClick = {
-                                        isExtracting = true
-                                        scope.launch {
-                                            try {
-                                                val sourcePageIndex = currentPageIndex
-                                                val sourceBitmap = kotlinx.coroutines.withTimeoutOrNull(1200) {
-                                                    pdfViewModel.getPageBitmap(sourcePageIndex).filterNotNull().first()
-                                                } ?: pdfViewModel.getPageBitmap(sourcePageIndex).value
-
-                                                val file = viewModel.extractRegionToShareFile(
-                                                    context = context,
-                                                    sourcePageIndex = sourcePageIndex,
-                                                    pdfPageBitmap = sourceBitmap
-                                                )
-                                                if (file != null) {
-                                                    val fileUri = androidx.core.content.FileProvider.getUriForFile(
-                                                        context,
-                                                        "${context.packageName}.fileprovider",
-                                                        file
-                                                    )
-                                                    aiFileUri = fileUri
-                                                    showAiPanel = true
-                                                }
-                                            } finally {
-                                                isExtracting = false
-                                            }
-                                        }
-                                    }
-                                ) {
-                                    Text("AI 解析")
-                                }
                                 androidx.compose.material3.IconButton(
                                     onClick = { viewModel.clearSelection() },
                                     modifier = Modifier.size(24.dp)
