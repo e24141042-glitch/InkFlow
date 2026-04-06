@@ -1,8 +1,10 @@
-﻿package com.vic.inkflow.ui
+package com.vic.inkflow.ui
 
 import com.vic.inkflow.util.reorderable
 import com.vic.inkflow.util.reorderableItem
 
+import android.content.ClipData
+import android.content.ClipDescription
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -40,6 +42,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.draganddrop.dragAndDropSource
+import androidx.compose.foundation.draganddrop.dragAndDropTarget
 import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -47,6 +51,8 @@ import androidx.compose.foundation.gestures.calculateCentroid
 import androidx.compose.foundation.gestures.calculateCentroidSize
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
@@ -125,6 +131,7 @@ import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.VerticalDivider
@@ -139,6 +146,7 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -160,10 +168,16 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.draganddrop.DragAndDropEvent
+import androidx.compose.ui.draganddrop.DragAndDropTarget
+import androidx.compose.ui.draganddrop.DragAndDropTransferData
+import androidx.compose.ui.draganddrop.toAndroidDragEvent
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
@@ -175,8 +189,10 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import com.vic.inkflow.R
 import com.vic.inkflow.data.AppDatabase
 import com.vic.inkflow.data.DocumentEntity
+import com.vic.inkflow.data.FolderEntity
 import com.vic.inkflow.data.ImageAnnotationEntity
 import com.vic.inkflow.data.StrokeWithPoints
 import com.vic.inkflow.data.TextAnnotationEntity
@@ -197,6 +213,7 @@ import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import kotlin.math.atan2
 import kotlin.math.cos
+import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -323,7 +340,6 @@ private fun AnimatedGradientBackground(isDarkTheme: Boolean, modifier: Modifier 
     Box(modifier = modifier.background(brush))
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DocumentLibraryScreen(
     navController: NavController,
@@ -333,12 +349,54 @@ fun DocumentLibraryScreen(
 ) {
     val context = LocalContext.current
     val docViewModel: DocumentViewModel = androidx.lifecycle.viewmodel.compose.viewModel(
-        factory = DocumentViewModelFactory(db.documentDao(), db.strokeDao(), db)
+        factory = DocumentViewModelFactory(db.documentDao(), db.folderDao(), db.strokeDao(), db)
     )
     val documents by docViewModel.documents.collectAsState()
+    val folders by docViewModel.folders.collectAsState()
+    val folderOperationMessage by docViewModel.folderOperationMessage.collectAsState()
     val scope = rememberCoroutineScope()
     var showFabMenu by remember { mutableStateOf(false) }
     var showNewDocSizeDialog by remember { mutableStateOf(false) }
+    var showCreateFolderDialog by remember { mutableStateOf(false) }
+    var createFolderInput by rememberSaveable { mutableStateOf("") }
+
+    LaunchedEffect(folderOperationMessage) {
+        val message = folderOperationMessage ?: return@LaunchedEffect
+        android.widget.Toast.makeText(context, message, android.widget.Toast.LENGTH_SHORT).show()
+        docViewModel.consumeFolderOperationMessage()
+    }
+
+    if (showCreateFolderDialog) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { showCreateFolderDialog = false },
+            title = { Text("建立新資料夾") },
+            text = {
+                androidx.compose.material3.OutlinedTextField(
+                    value = createFolderInput,
+                    onValueChange = { createFolderInput = it },
+                    singleLine = true,
+                    label = { Text("資料夾名稱") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val name = createFolderInput.trim()
+                        if (name.isNotEmpty()) {
+                            docViewModel.createFolder(name)
+                            createFolderInput = ""
+                            showCreateFolderDialog = false
+                        }
+                    },
+                    enabled = createFolderInput.trim().isNotEmpty()
+                ) { Text("建立") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showCreateFolderDialog = false }) { Text("取消") }
+            }
+        )
+    }
 
     if (showNewDocSizeDialog) {
         NewDocPaperSizeDialog(
@@ -361,11 +419,6 @@ fun DocumentLibraryScreen(
                 }
             }
         )
-    }
-
-    // Migrate stale display names saved before the ContentResolver fix
-    LaunchedEffect(Unit) {
-        docViewModel.fixStaleNames(context)
     }
 
     val pdfLauncher = rememberLauncherForActivityResult(
@@ -409,12 +462,52 @@ fun DocumentLibraryScreen(
         documents.filter { doc ->
             val matchesQuery = normalizedQuery.isEmpty() || doc.displayName.contains(normalizedQuery, ignoreCase = true)
             val matchesTab = when (selectedNavIndex) {
-                1 -> doc.folderName != null // Assuming Folders tab shows documents that have folder
+                1 -> true
                 2 -> doc.isFavorite
                 else -> true // Home
             }
             matchesQuery && matchesTab
         }
+    }
+    val folderTree = remember(folders, documents, normalizedQuery) {
+        val folderScopedDocs = documents
+            .asSequence()
+            .filter { it.folderId != null }
+            .groupBy { it.folderId }
+
+        val childrenMap = folders.groupBy { it.parentFolderId }
+
+        fun buildNode(folder: FolderEntity): FolderNode? {
+            val childNodes = childrenMap[folder.id].orEmpty().mapNotNull { buildNode(it) }
+            val docs = folderScopedDocs[folder.id].orEmpty()
+            
+            if (normalizedQuery.isNotEmpty()) {
+                val matchedDocs = docs.filter { it.displayName.contains(normalizedQuery, ignoreCase = true) }
+                val folderMatches = folder.name.contains(normalizedQuery, ignoreCase = true)
+                if (matchedDocs.isNotEmpty() || folderMatches || childNodes.isNotEmpty()) {
+                    return FolderNode(folder, matchedDocs, childNodes)
+                } else {
+                    return null
+                }
+            }
+            return FolderNode(folder, docs, childNodes)
+        }
+        
+        childrenMap[null].orEmpty().mapNotNull { buildNode(it) }
+    }
+    val uncategorizedDocs = remember(folders, documents, normalizedQuery) {
+        val knownFolderIds = folders.map { it.id }.toHashSet()
+        documents.filter { doc ->
+            val matchesQuery = normalizedQuery.isEmpty() || doc.displayName.contains(normalizedQuery, ignoreCase = true)
+            val noFolder = doc.folderId == null || doc.folderId !in knownFolderIds
+            matchesQuery && noFolder
+        }
+    }
+    val visibleDocumentCount = if (selectedNavIndex == 1) {
+        fun countDocs(nodes: List<FolderNode>): Int = nodes.sumOf { it.documents.size + countDocs(it.children) }
+        countDocs(folderTree) + uncategorizedDocs.size
+    } else {
+        filteredDocs.size
     }
     var isGridView by rememberSaveable { mutableStateOf(true) }
 
@@ -493,10 +586,12 @@ fun DocumentLibraryScreen(
                     searchQuery = searchQuery,
                     onSearchQueryChange = { searchQuery = it },
                     totalDocuments = documents.size,
-                    visibleDocuments = filteredDocs.size,
+                    visibleDocuments = visibleDocumentCount,
                     isDarkTheme = isDarkTheme,
                     isGridView = isGridView,
-                    onToggleGridView = { isGridView = !isGridView }
+                    onToggleGridView = { isGridView = !isGridView },
+                    selectedNavIndex = selectedNavIndex,
+                    onCreateFolder = { showCreateFolderDialog = true }
                 )
             },
             floatingActionButton = {
@@ -512,6 +607,10 @@ fun DocumentLibraryScreen(
                     onCreateBlank = {
                         showFabMenu = false
                         showNewDocSizeDialog = true
+                    },
+                    onCreateFolder = {
+                        showFabMenu = false
+                        showCreateFolderDialog = true
                     }
                 )
             }
@@ -549,7 +648,7 @@ fun DocumentLibraryScreen(
                                     color = MaterialTheme.colorScheme.primary
                                 )
                                 Text(
-                                    text = "\"$normalizedQuery\" 對應 ${filteredDocs.size} 份筆記",
+                                    text = "\"$normalizedQuery\" 對應 ${visibleDocumentCount} 份筆記",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -562,7 +661,42 @@ fun DocumentLibraryScreen(
                 }
 
                 Box(modifier = Modifier.fillMaxSize()) {
-                if (filteredDocs.isEmpty()) {
+                if (selectedNavIndex == 1) {
+                    if (folders.isEmpty() && uncategorizedDocs.isEmpty()) {
+                        LibraryEmptyState(
+                            modifier = Modifier.fillMaxSize(),
+                            brandGradient = brandGradient,
+                            isSearchActive = normalizedQuery.isNotEmpty(),
+                            searchQuery = normalizedQuery,
+                            onClearSearch = { searchQuery = "" },
+                            onOpenPdf = { pdfLauncher.launch(arrayOf("application/pdf")) },
+                            onCreateBlank = { showNewDocSizeDialog = true }
+                        )
+                    } else {
+                        FolderGroupedDocumentsView(
+                            folderTree = folderTree,
+                            uncategorizedDocs = uncategorizedDocs,
+                            availableFolders = folders,
+                            docViewModel = docViewModel,
+                            context = context,
+                            onOpenDocument = { uri ->
+                                val encodedUri = URLEncoder.encode(uri, StandardCharsets.UTF_8.toString())
+                                navController.navigate("editor/$encodedUri")
+                            },
+                            onDelete = { uri -> docViewModel.delete(uri) },
+                            onFavoriteToggle = { uri, isFav -> docViewModel.toggleFavorite(uri, isFav) },
+                            onRename = { uri, newName -> docViewModel.rename(uri, newName) },
+                            onMoveToFolder = { uri, folderId -> docViewModel.moveDocumentToFolder(uri, folderId) },
+                            onCreateFolder = { folderName, parentId -> docViewModel.createFolder(folderName, parentId) },
+                            onRenameFolder = { folderId, newName -> docViewModel.renameFolder(folderId, newName) },
+                            onDeleteFolder = { folderId -> docViewModel.deleteFolder(folderId) },
+                            onMoveFolder = { folderId, moveUp -> docViewModel.moveFolder(folderId, moveUp) },
+                            onMoveFolderToParent = { folderId, targetParentId ->
+                                docViewModel.moveFolderToParent(folderId, targetParentId)
+                            }
+                        )
+                    }
+                } else if (filteredDocs.isEmpty()) {
                     LibraryEmptyState(
                         modifier = Modifier.fillMaxSize(),
                         brandGradient = brandGradient,
@@ -601,13 +735,16 @@ fun DocumentLibraryScreen(
                                     DocumentCard(
                                         document = doc,
                                         coverBitmap = coverBitmap,
+                                        availableFolders = folders,
                                         onClick = {
                                             val encodedUri = URLEncoder.encode(doc.uri, StandardCharsets.UTF_8.toString())
                                             navController.navigate("editor/$encodedUri")
                                         },
                                         onDelete = { docViewModel.delete(doc.uri) },
                                         onFavoriteToggle = { isFav -> docViewModel.toggleFavorite(doc.uri, isFav) },
-                                        onRename = { newName -> docViewModel.rename(doc.uri, newName) }
+                                        onRename = { newName -> docViewModel.rename(doc.uri, newName) },
+                                        onMoveToFolder = { folderId -> docViewModel.moveDocumentToFolder(doc.uri, folderId) },
+                                        onCreateFolder = { folderName -> docViewModel.createFolder(folderName) }
                                     )
                                 }
                             }
@@ -638,13 +775,16 @@ fun DocumentLibraryScreen(
                                     DocumentListRow(
                                         document = doc,
                                         coverBitmap = coverBitmap,
+                                        availableFolders = folders,
                                         onClick = {
                                             val encodedUri = URLEncoder.encode(doc.uri, StandardCharsets.UTF_8.toString())
                                             navController.navigate("editor/$encodedUri")
                                         },
                                         onDelete = { docViewModel.delete(doc.uri) },
                                         onFavoriteToggle = { isFav -> docViewModel.toggleFavorite(doc.uri, isFav) },
-                                        onRename = { newName -> docViewModel.rename(doc.uri, newName) }
+                                        onRename = { newName -> docViewModel.rename(doc.uri, newName) },
+                                        onMoveToFolder = { folderId -> docViewModel.moveDocumentToFolder(doc.uri, folderId) },
+                                        onCreateFolder = { folderName -> docViewModel.createFolder(folderName) }
                                     )
                                 }
                             }
@@ -658,6 +798,547 @@ fun DocumentLibraryScreen(
     }   // close outer Box (background + gradient overlay)
 }
 
+
+data class FolderNode(
+    val folder: FolderEntity,
+    val documents: List<DocumentEntity>,
+    val children: List<FolderNode>
+)
+
+private const val DOCUMENT_DRAG_LABEL = "InkFlowDocumentUri"
+private const val DOCUMENT_DRAG_PREFIX = "inkflow-doc-uri:"
+
+private fun extractDraggedDocumentUri(event: DragAndDropEvent): String? {
+    val androidEvent = event.toAndroidDragEvent()
+    (androidEvent.localState as? String)?.takeIf { it.isNotBlank() }?.let { return it }
+
+    val clipData = androidEvent.clipData ?: return null
+    if (clipData.itemCount == 0) return null
+
+    val item = clipData.getItemAt(0)
+    val payload = item.text?.toString() ?: item.coerceToText(null)?.toString() ?: return null
+    return if (payload.startsWith(DOCUMENT_DRAG_PREFIX)) {
+        payload.removePrefix(DOCUMENT_DRAG_PREFIX).ifBlank { null }
+    } else {
+        null
+    }
+}
+
+private fun buildDocumentDragTransfer(documentUri: String): DragAndDropTransferData {
+    return DragAndDropTransferData(
+        clipData = ClipData.newPlainText(
+            DOCUMENT_DRAG_LABEL,
+            "$DOCUMENT_DRAG_PREFIX$documentUri"
+        ),
+        localState = documentUri
+    )
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+private fun Modifier.documentDragSource(documentUri: String): Modifier {
+    return this.dragAndDropSource {
+        detectDragGesturesAfterLongPress(
+            onDragStart = {
+                startTransfer(buildDocumentDragTransfer(documentUri))
+            },
+            onDrag = { change, _ ->
+                change.consume()
+            }
+        )
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun FolderGroupedDocumentsView(
+    folderTree: List<FolderNode>,
+    uncategorizedDocs: List<DocumentEntity>,
+    availableFolders: List<FolderEntity>,
+    docViewModel: DocumentViewModel,
+    context: android.content.Context,
+    onOpenDocument: (String) -> Unit,
+    onDelete: (String) -> Unit,
+    onFavoriteToggle: (String, Boolean) -> Unit,
+    onRename: (String, String) -> Unit,
+    onMoveToFolder: (String, String?) -> Unit,
+    onCreateFolder: (String, String?) -> Unit,
+    onRenameFolder: (String, String) -> Unit,
+    onDeleteFolder: (String) -> Unit,
+    onMoveFolder: (String, Boolean) -> Unit,
+    onMoveFolderToParent: (String, String?) -> Unit
+) {
+val collapsedSections = remember { mutableStateMapOf<String, Boolean>() }
+    fun isCollapsed(sectionId: String): Boolean = collapsedSections[sectionId] == true
+
+    val flatFolders = remember(folderTree, collapsedSections.toMap()) {
+        fun flatten(nodes: List<FolderNode>, level: Int): List<Pair<FolderNode, Int>> {
+            val result = mutableListOf<Pair<FolderNode, Int>>()
+            for (node in nodes) {
+                result.add(node to level)
+                if (collapsedSections[node.folder.id] != true) {
+                    result.addAll(flatten(node.children, level + 1))
+                }
+            }
+            return result
+        }
+        flatten(folderTree, 0)
+    }
+
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(top = 6.dp, bottom = 120.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        if (uncategorizedDocs.isNotEmpty()) {
+            item(key = "uncategorized") {
+                var isDropTargetActive by remember { mutableStateOf(false) }
+                Surface(
+                    modifier = Modifier.dragAndDropTarget(
+                        shouldStartDragAndDrop = { event ->
+                            extractDraggedDocumentUri(event) != null ||
+                                event.toAndroidDragEvent().clipDescription
+                                    ?.hasMimeType(ClipDescription.MIMETYPE_TEXT_PLAIN) == true
+                        },
+                        target = object : DragAndDropTarget {
+                            override fun onEntered(event: DragAndDropEvent) {
+                                isDropTargetActive = true
+                            }
+
+                            override fun onExited(event: DragAndDropEvent) {
+                                isDropTargetActive = false
+                            }
+
+                            override fun onEnded(event: DragAndDropEvent) {
+                                isDropTargetActive = false
+                            }
+
+                            override fun onDrop(event: DragAndDropEvent): Boolean {
+                                val docUri = extractDraggedDocumentUri(event) ?: return false
+                                onMoveToFolder(docUri, null)
+                                isDropTargetActive = false
+                                return true
+                            }
+                        }
+                    ),
+                    shape = RoundedCornerShape(16.dp),
+                    color = if (isDropTargetActive) {
+                        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f)
+                    } else {
+                        MaterialTheme.colorScheme.surface.copy(alpha = 0.78f)
+                    },
+                    border = BorderStroke(
+                        1.dp,
+                        if (isDropTargetActive) {
+                            MaterialTheme.colorScheme.primary.copy(alpha = 0.8f)
+                        } else {
+                            MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
+                        }
+                    )
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                IconButton(onClick = {
+                                    val key = "uncategorized"
+                                    collapsedSections[key] = !isCollapsed(key)
+                                }) {
+                                    Icon(
+                                        imageVector = Icons.Default.ChevronRight,
+                                        contentDescription = "展開或收合",
+                                        modifier = Modifier.graphicsLayer { rotationZ = if (isCollapsed("uncategorized")) 0f else 90f }
+                                    )
+                                }
+                                Icon(Icons.Default.Folder, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                                Text("未分類", style = MaterialTheme.typography.titleMedium)
+                            }
+                            Text(
+                                text = "${uncategorizedDocs.size} 份",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+
+                        AnimatedVisibility(visible = !isCollapsed("uncategorized")) {
+                            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                uncategorizedDocs.forEach { doc ->
+                                    val coverBitmap by docViewModel.getDocumentThumbnail(context, doc.uri).collectAsState()
+                                    DocumentListRow(
+                                        document = doc,
+                                        coverBitmap = coverBitmap,
+                                        availableFolders = availableFolders,
+                                        onClick = { onOpenDocument(doc.uri) },
+                                        onDelete = { onDelete(doc.uri) },
+                                        onFavoriteToggle = { isFav -> onFavoriteToggle(doc.uri, isFav) },
+                                        onRename = { newName -> onRename(doc.uri, newName) },
+                                        onMoveToFolder = { folderId -> onMoveToFolder(doc.uri, folderId) },
+                                        onCreateFolder = { folderName -> onCreateFolder(folderName, null) }
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        items(flatFolders.size, key = { flatFolders[it].first.folder.id }) { sectionIndex ->
+            val (node, level) = flatFolders[sectionIndex]
+            val folder = node.folder
+            val docs = node.documents
+            var showFolderMenu by remember(folder.id) { mutableStateOf(false) }
+            var showRenameFolderDialog by remember(folder.id) { mutableStateOf(false) }
+            var showDeleteFolderDialog by remember(folder.id) { mutableStateOf(false) }
+            var showNewChildFolderDialog by remember(folder.id) { mutableStateOf(false) }
+            var showMoveFolderDialog by remember(folder.id) { mutableStateOf(false) }
+            var newChildFolderName by remember(folder.id) { mutableStateOf("") }
+            var renameFolderInput by remember(folder.id, folder.name) { mutableStateOf(folder.name) }
+            var folderDragAccumulator by remember(folder.id) { mutableFloatStateOf(0f) }
+            var isFolderDropTargetActive by remember(folder.id) { mutableStateOf(false) }
+
+            val descendantFolderIds = remember(folder.id, node.children) {
+                val ids = mutableSetOf<String>()
+                fun collect(children: List<FolderNode>) {
+                    children.forEach { child ->
+                        ids.add(child.folder.id)
+                        collect(child.children)
+                    }
+                }
+                collect(node.children)
+                ids
+            }
+
+            val movableParentCandidates = remember(
+                availableFolders,
+                folder.id,
+                folder.parentFolderId,
+                descendantFolderIds
+            ) {
+                availableFolders.filter { candidate ->
+                    candidate.id != folder.id &&
+                        candidate.id != folder.parentFolderId &&
+                        candidate.id !in descendantFolderIds
+                }
+            }
+
+                        if (showNewChildFolderDialog) {
+                androidx.compose.material3.AlertDialog(
+                    onDismissRequest = { showNewChildFolderDialog = false },
+                    title = { Text("建立子資料夾") },
+                    text = {
+                        androidx.compose.material3.OutlinedTextField(
+                            value = newChildFolderName,
+                            onValueChange = { newChildFolderName = it },
+                            singleLine = true,
+                            label = { Text("資料夾名稱") },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    },
+                    confirmButton = {
+                        TextButton(
+                            onClick = {
+                                onCreateFolder(newChildFolderName, folder.id)
+                                showNewChildFolderDialog = false
+                            },
+                            enabled = newChildFolderName.trim().isNotEmpty()
+                        ) { Text("建立") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showNewChildFolderDialog = false }) { Text("取消") }
+                    }
+                )
+            }
+
+            if (showRenameFolderDialog) {
+                androidx.compose.material3.AlertDialog(
+                    onDismissRequest = { showRenameFolderDialog = false },
+                    title = { Text("重新命名資料夾") },
+                    text = {
+                        androidx.compose.material3.OutlinedTextField(
+                            value = renameFolderInput,
+                            onValueChange = { renameFolderInput = it },
+                            singleLine = true,
+                            label = { Text("資料夾名稱") },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    },
+                    confirmButton = {
+                        TextButton(
+                            onClick = {
+                                onRenameFolder(folder.id, renameFolderInput)
+                                showRenameFolderDialog = false
+                            },
+                            enabled = renameFolderInput.trim().isNotEmpty()
+                        ) { Text("確認") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showRenameFolderDialog = false }) { Text("取消") }
+                    }
+                )
+            }
+
+            if (showDeleteFolderDialog) {
+                androidx.compose.material3.AlertDialog(
+                    onDismissRequest = { showDeleteFolderDialog = false },
+                    title = { Text("刪除資料夾") },
+                    text = { Text("確定要刪除「${folder.name}」嗎？子資料夾會一併刪除，內含文件會保留並移到未分類。") },
+                    confirmButton = {
+                        TextButton(
+                            onClick = {
+                                showDeleteFolderDialog = false
+                                onDeleteFolder(folder.id)
+                            }
+                        ) { Text("刪除", color = MaterialTheme.colorScheme.error) }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showDeleteFolderDialog = false }) { Text("取消") }
+                    }
+                )
+            }
+
+            if (showMoveFolderDialog) {
+                androidx.compose.material3.AlertDialog(
+                    onDismissRequest = { showMoveFolderDialog = false },
+                    title = { Text("移動資料夾") },
+                    text = {
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            TextButton(
+                                onClick = {
+                                    onMoveFolderToParent(folder.id, null)
+                                    showMoveFolderDialog = false
+                                },
+                                enabled = folder.parentFolderId != null
+                            ) {
+                                Text("移到最上層")
+                            }
+
+                            if (movableParentCandidates.isEmpty()) {
+                                Text(
+                                    text = "沒有可移動的目標資料夾",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
+                                )
+                            } else {
+                                movableParentCandidates.forEach { candidate ->
+                                    TextButton(
+                                        onClick = {
+                                            onMoveFolderToParent(folder.id, candidate.id)
+                                            showMoveFolderDialog = false
+                                        }
+                                    ) {
+                                        Text("移到「${candidate.name}」")
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    confirmButton = {
+                        TextButton(onClick = { showMoveFolderDialog = false }) { Text("關閉") }
+                    }
+                )
+            }
+
+            Surface(
+                modifier = Modifier
+                    .padding(start = (level * 24).dp)
+                    .dragAndDropTarget(
+                        shouldStartDragAndDrop = { event ->
+                            extractDraggedDocumentUri(event) != null ||
+                                event.toAndroidDragEvent().clipDescription
+                                    ?.hasMimeType(ClipDescription.MIMETYPE_TEXT_PLAIN) == true
+                        },
+                        target = object : DragAndDropTarget {
+                            override fun onEntered(event: DragAndDropEvent) {
+                                isFolderDropTargetActive = true
+                            }
+
+                            override fun onExited(event: DragAndDropEvent) {
+                                isFolderDropTargetActive = false
+                            }
+
+                            override fun onEnded(event: DragAndDropEvent) {
+                                isFolderDropTargetActive = false
+                            }
+
+                            override fun onDrop(event: DragAndDropEvent): Boolean {
+                                val docUri = extractDraggedDocumentUri(event) ?: return false
+                                onMoveToFolder(docUri, folder.id)
+                                isFolderDropTargetActive = false
+                                return true
+                            }
+                        }
+                    ),
+                shape = RoundedCornerShape(16.dp),
+                color = if (isFolderDropTargetActive) {
+                    MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f)
+                } else {
+                    MaterialTheme.colorScheme.surface.copy(alpha = 0.78f)
+                },
+                border = BorderStroke(
+                    1.dp,
+                    if (isFolderDropTargetActive) {
+                        MaterialTheme.colorScheme.primary.copy(alpha = 0.8f)
+                    } else {
+                        MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
+                    }
+                )
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            IconButton(onClick = {
+                                collapsedSections[folder.id] = !isCollapsed(folder.id)
+                            }) {
+                                Icon(
+                                    imageVector = Icons.Default.ChevronRight,
+                                    contentDescription = "展開或收合",
+                                    modifier = Modifier.graphicsLayer { rotationZ = if (isCollapsed(folder.id)) 0f else 90f }
+                                )
+                            }
+                            Icon(Icons.Default.Folder, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                            Text(folder.name, style = MaterialTheme.typography.titleMedium)
+                            Icon(
+                                imageVector = Icons.Default.MoreVert,
+                                contentDescription = "拖曳排序",
+                                modifier = Modifier
+                                    .size(20.dp)
+                                    .pointerInput(folder.id, sectionIndex) {
+                                        detectDragGesturesAfterLongPress(
+                                            onDragStart = {
+                                                folderDragAccumulator = 0f
+                                            },
+                                            onDragCancel = {
+                                                folderDragAccumulator = 0f
+                                            },
+                                            onDragEnd = {
+                                                folderDragAccumulator = 0f
+                                            },
+                                            onDrag = { change, dragAmount ->
+                                                change.consume()
+                                                folderDragAccumulator += dragAmount.y
+                                                val threshold = 36f
+                                                if (folderDragAccumulator > threshold) {
+                                                    onMoveFolder(folder.id, false)
+                                                    folderDragAccumulator = 0f
+                                                } else if (folderDragAccumulator < -threshold) {
+                                                    onMoveFolder(folder.id, true)
+                                                    folderDragAccumulator = 0f
+                                                }
+                                            }
+                                        )
+                                    }
+                            )
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = "${docs.size} 份",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Box {
+                                IconButton(onClick = { showFolderMenu = true }) {
+                                    Icon(Icons.Default.MoreVert, contentDescription = "資料夾操作")
+                                }
+                                androidx.compose.material3.DropdownMenu(
+                                    expanded = showFolderMenu,
+                                    onDismissRequest = { showFolderMenu = false }
+                                ) {
+                                    androidx.compose.material3.DropdownMenuItem(
+                                        text = { Text("新增子資料夾") },
+                                        leadingIcon = { Icon(Icons.Default.Folder, contentDescription = null) },
+                                        onClick = {
+                                            showFolderMenu = false
+                                            newChildFolderName = ""
+                                            showNewChildFolderDialog = true
+                                        }
+                                    )
+                                    androidx.compose.material3.DropdownMenuItem(
+                                        text = { Text("移動到其他資料夾") },
+                                        leadingIcon = { Icon(Icons.Default.Folder, contentDescription = null) },
+                                        onClick = {
+                                            showFolderMenu = false
+                                            showMoveFolderDialog = true
+                                        }
+                                    )
+                                    androidx.compose.material3.DropdownMenuItem(
+                                        text = { Text("重新命名") },
+                                        leadingIcon = { Icon(Icons.Default.Create, contentDescription = null) },
+                                        onClick = {
+                                            showFolderMenu = false
+                                            renameFolderInput = folder.name
+                                            showRenameFolderDialog = true
+                                        }
+                                    )
+                                    androidx.compose.material3.DropdownMenuItem(
+                                        text = { Text("刪除資料夾") },
+                                        leadingIcon = { Icon(Icons.Default.Delete, contentDescription = null) },
+                                        onClick = {
+                                            showFolderMenu = false
+                                            showDeleteFolderDialog = true
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    AnimatedVisibility(visible = !isCollapsed(folder.id)) {
+                        if (docs.isEmpty()) {
+                            Text(
+                                text = "這個資料夾目前是空的，尚未加入文件。",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                                modifier = Modifier.padding(vertical = 12.dp, horizontal = 8.dp)
+                            )
+                        } else {
+                            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                docs.forEach { doc ->
+                                    val coverBitmap by docViewModel.getDocumentThumbnail(context, doc.uri).collectAsState()
+                                    DocumentListRow(
+                                        document = doc,
+                                        coverBitmap = coverBitmap,
+                                        availableFolders = availableFolders,
+                                        onClick = { onOpenDocument(doc.uri) },
+                                        onDelete = { onDelete(doc.uri) },
+                                        onFavoriteToggle = { isFav -> onFavoriteToggle(doc.uri, isFav) },
+                                        onRename = { newName -> onRename(doc.uri, newName) },
+                                        onMoveToFolder = { folderId -> onMoveToFolder(doc.uri, folderId) },
+                                        onCreateFolder = { folderName -> onCreateFolder(folderName, null) }
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 @Composable
 private fun LibraryHeroPanel(
     searchQuery: String,
@@ -666,7 +1347,9 @@ private fun LibraryHeroPanel(
     visibleDocuments: Int,
     isDarkTheme: Boolean,
     isGridView: Boolean,
-    onToggleGridView: () -> Unit
+    onToggleGridView: () -> Unit,
+    selectedNavIndex: Int = 0,
+    onCreateFolder: () -> Unit = {}
 ) {
     val heroSurfaceColor = if (isDarkTheme) {
         ToolbarGlassDark.copy(alpha = 0.92f)
@@ -682,31 +1365,35 @@ private fun LibraryHeroPanel(
     ) {
         Surface(
             color = heroSurfaceColor,
-            shape = RoundedCornerShape(30.dp),
+            shape = RoundedCornerShape(if (selectedNavIndex == 1) 24.dp else 30.dp),
             border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.38f)),
-            shadowElevation = 10.dp
+            shadowElevation = if (selectedNavIndex == 1) 4.dp else 10.dp
         ) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 20.dp, vertical = 18.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp)
+                    .padding(
+                        horizontal = 20.dp,
+                        vertical = if (selectedNavIndex == 1) 12.dp else 18.dp
+                    ),
+                verticalArrangement = Arrangement.spacedBy(if (selectedNavIndex == 1) 12.dp else 16.dp)
             ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(
-                        modifier = Modifier.weight(1f),
-                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                if (selectedNavIndex == 0) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(
-                            text = "InkFlow Studio",
-                            style = MaterialTheme.typography.labelLarge,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                        Text(
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Text(
+                                text = "InkFlow Studio",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Text(
                             text = "把今天的 PDF、草圖與註記集中在同一個工作台",
                             style = MaterialTheme.typography.headlineSmall
                         )
@@ -734,10 +1421,11 @@ private fun LibraryHeroPanel(
                         }
                     }
                 }
+                } // 結束 if (selectedNavIndex == 0)
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     androidx.compose.material3.OutlinedTextField(
@@ -758,30 +1446,53 @@ private fun LibraryHeroPanel(
                         shape = RoundedCornerShape(24.dp),
                         modifier = Modifier.weight(1f)
                     )
-                    IconButton(
-                        onClick = onToggleGridView,
-                        modifier = Modifier.background(MaterialTheme.colorScheme.surfaceVariant, CircleShape)
-                    ) {
-                        Icon(
-                            imageVector = if (isGridView) Icons.AutoMirrored.Filled.List else Icons.Default.Apps,
-                            contentDescription = "切換檢視",
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                    
+                    if (selectedNavIndex == 1) {
+                        Surface(
+                            shape = CircleShape,
+                            color = MaterialTheme.colorScheme.primaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                            modifier = Modifier.clickable(onClick = onCreateFolder)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(20.dp))
+                                Text("新增資料夾", style = MaterialTheme.typography.labelLarge)
+                            }
+                        }
+                    }
+
+                    if (selectedNavIndex == 0) {
+                        IconButton(
+                            onClick = onToggleGridView,
+                            modifier = Modifier.background(MaterialTheme.colorScheme.surfaceVariant, CircleShape)
+                        ) {
+                            Icon(
+                                imageVector = if (isGridView) Icons.AutoMirrored.Filled.List else Icons.Default.Apps,
+                                contentDescription = "切換檢視",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
                     }
                 }
 
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    LibraryStatPill(
-                        title = "目前顯示",
-                        value = "$visibleDocuments 份"
-                    )
-                    LibraryStatPill(
-                        title = if (searchQuery.isBlank()) "狀態" else "搜尋模式",
-                        value = if (searchQuery.isBlank()) "工作台待命" else "已套用關鍵字"
-                    )
+                if (selectedNavIndex == 0) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        LibraryStatPill(
+                            title = "目前顯示",
+                            value = "$visibleDocuments 份"
+                        )
+                        LibraryStatPill(
+                            title = if (searchQuery.isBlank()) "狀態" else "搜尋模式",
+                            value = if (searchQuery.isBlank()) "工作台待命" else "已套用關鍵字"
+                        )
+                    }
                 }
             }
         }
@@ -812,7 +1523,8 @@ private fun DocumentLibraryFab(
     onToggleMenu: () -> Unit,
     onDismissMenu: () -> Unit,
     onOpenPdf: () -> Unit,
-    onCreateBlank: () -> Unit
+    onCreateBlank: () -> Unit,
+    onCreateFolder: () -> Unit
 ) {
     Box {
         val fabInteractionSource = remember { MutableInteractionSource() }
@@ -864,6 +1576,11 @@ private fun DocumentLibraryFab(
                 text = { Text("空白筆記") },
                 leadingIcon = { Icon(Icons.Filled.Add, contentDescription = null) },
                 onClick = onCreateBlank
+            )
+            androidx.compose.material3.DropdownMenuItem(
+                text = { Text("新增資料夾") },
+                leadingIcon = { Icon(Icons.Default.Folder, contentDescription = null) },
+                onClick = onCreateFolder
             )
         }
     }
@@ -1006,18 +1723,25 @@ private fun LibraryEmptyState(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun DocumentCard(
     document: DocumentEntity,
     coverBitmap: Bitmap?,
+    availableFolders: List<FolderEntity>,
     onClick: () -> Unit,
     onDelete: () -> Unit,
     onRename: (String) -> Unit = {},
-    onFavoriteToggle: (Boolean) -> Unit = {}
+    onFavoriteToggle: (Boolean) -> Unit = {},
+    onMoveToFolder: (String?) -> Unit = {},
+    onCreateFolder: (String) -> Unit = {}
 ) {
     var showRenameDialog by remember { mutableStateOf(false) }
     var showDeleteDialog by remember { mutableStateOf(false) }
+    var showMoveDialog by remember { mutableStateOf(false) }
+    var showCreateFolderDialog by remember { mutableStateOf(false) }
     var renameInput by remember(document.displayName) { mutableStateOf(document.displayName) }
+    var folderInput by remember { mutableStateOf("") }
     val isDarkSurface = MaterialTheme.colorScheme.background.luminance() < 0.5f
     val cardShellColor = if (isDarkSurface) {
         MaterialTheme.colorScheme.surface.copy(alpha = 0.84f)
@@ -1081,6 +1805,80 @@ private fun DocumentCard(
         )
     }
 
+    if (showMoveDialog) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { showMoveDialog = false },
+            title = { Text("移到資料夾") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = {
+                        onMoveToFolder(null)
+                        showMoveDialog = false
+                    }) {
+                        Text("設為未分類")
+                    }
+                    if (availableFolders.isEmpty()) {
+                        Text(
+                            text = "尚未建立資料夾",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    } else {
+                        availableFolders.forEach { folder ->
+                            TextButton(onClick = {
+                                onMoveToFolder(folder.id)
+                                showMoveDialog = false
+                            }) {
+                                Text(folder.name)
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showMoveDialog = false
+                    showCreateFolderDialog = true
+                }) { Text("新增資料夾") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showMoveDialog = false }) { Text("關閉") }
+            }
+        )
+    }
+
+    if (showCreateFolderDialog) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { showCreateFolderDialog = false },
+            title = { Text("建立資料夾") },
+            text = {
+                androidx.compose.material3.OutlinedTextField(
+                    value = folderInput,
+                    onValueChange = { folderInput = it },
+                    singleLine = true,
+                    label = { Text("資料夾名稱") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val name = folderInput.trim()
+                        if (name.isNotEmpty()) {
+                            onCreateFolder(name)
+                            folderInput = ""
+                            showCreateFolderDialog = false
+                        }
+                    },
+                    enabled = folderInput.trim().isNotEmpty()
+                ) { Text("建立") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showCreateFolderDialog = false }) { Text("取消") }
+            }
+        )
+    }
+
     val brandGradient = androidx.compose.ui.graphics.Brush.linearGradient(
         listOf(
             BrandIndigo.copy(alpha = 0.12f),
@@ -1102,7 +1900,11 @@ private fun DocumentCard(
 
     androidx.compose.material3.Card(
         onClick = onClick,
-        modifier = Modifier.fillMaxWidth().aspectRatio(0.85f).graphicsLayer { scaleX = cardScale; scaleY = cardScale },
+        modifier = Modifier
+            .fillMaxWidth()
+            .aspectRatio(0.85f)
+            .graphicsLayer { scaleX = cardScale; scaleY = cardScale }
+            .documentDragSource(document.uri),
         shape = androidx.compose.foundation.shape.RoundedCornerShape(24.dp),
         colors = androidx.compose.material3.CardDefaults.cardColors(containerColor = cardShellColor),
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)),
@@ -1204,6 +2006,22 @@ private fun DocumentCard(
                             onDismissRequest = { showMenu = false }
                         ) {
                             androidx.compose.material3.DropdownMenuItem(
+                                text = { Text("移到資料夾") },
+                                leadingIcon = { Icon(Icons.Default.Folder, contentDescription = null) },
+                                onClick = {
+                                    showMenu = false
+                                    showMoveDialog = true
+                                }
+                            )
+                            androidx.compose.material3.DropdownMenuItem(
+                                text = { Text("新增資料夾") },
+                                leadingIcon = { Icon(Icons.Default.Add, contentDescription = null) },
+                                onClick = {
+                                    showMenu = false
+                                    showCreateFolderDialog = true
+                                }
+                            )
+                            androidx.compose.material3.DropdownMenuItem(
                                 text = { Text("重新命名") },
                                 leadingIcon = { Icon(Icons.Default.Create, contentDescription = null) },
                                 onClick = {
@@ -1254,9 +2072,9 @@ fun TabletEditorScreen(navController: NavController, uri: Uri, db: AppDatabase) 
     val scope = rememberCoroutineScope()
 
     val docViewModel: DocumentViewModel = viewModel(
-        factory = DocumentViewModelFactory(db.documentDao(), db.strokeDao(), db)
+        factory = DocumentViewModelFactory(db.documentDao(), db.folderDao(), db.strokeDao(), db)
     )
-    var sidebarMode by rememberSaveable { mutableStateOf(SidebarMode.NORMAL) }
+    var sidebarMode by rememberSaveable { mutableStateOf(SidebarMode.COLLAPSED) }
     val activeTool by viewModel.selectedTool.collectAsState()
     var currentPageIndex by rememberSaveable { mutableIntStateOf(0) }
     var showStrokeWidthSlider by rememberSaveable { mutableStateOf(false) }
@@ -1264,6 +2082,7 @@ fun TabletEditorScreen(navController: NavController, uri: Uri, db: AppDatabase) 
     var initialPageRestored by rememberSaveable { mutableStateOf(false) }
 
     var showAiPanel by rememberSaveable { mutableStateOf(false) }
+    var aiPanelWeight by rememberSaveable { mutableFloatStateOf(0.4f) }
     var aiFileUri by remember { mutableStateOf<android.net.Uri?>(null) }
     val sidebarListState = rememberLazyListState()
 
@@ -1281,8 +2100,8 @@ fun TabletEditorScreen(navController: NavController, uri: Uri, db: AppDatabase) 
         }
     }
 
-    // Persist current page and sync sidebar scroll whenever the user navigates
-    androidx.compose.runtime.LaunchedEffect(currentPageIndex) {
+    // Persist current page and sync sidebar scroll whenever the user navigates or changes sidebar mode
+    androidx.compose.runtime.LaunchedEffect(currentPageIndex, sidebarMode) {
         if (initialPageRestored) {
             docViewModel.updateLastPage(uri.toString(), currentPageIndex)
             sidebarListState.animateScrollToCenter(currentPageIndex)
@@ -1300,10 +2119,18 @@ fun TabletEditorScreen(navController: NavController, uri: Uri, db: AppDatabase) 
 
     // Open PDF once; PdfViewModel survives config changes
     androidx.compose.runtime.LaunchedEffect(uri) {
+        docViewModel.markDocumentOpened(uri.toString())
         pdfViewModel.openPdf(uri)
     }
     val pageCount by pdfViewModel.pageCount.collectAsState()
     val isPageOperationInProgress by pdfViewModel.isPageOperationInProgress.collectAsState()
+    val pageOperationMessage by pdfViewModel.pageOperationMessage.collectAsState()
+
+    androidx.compose.runtime.LaunchedEffect(pageOperationMessage) {
+        val message = pageOperationMessage ?: return@LaunchedEffect
+        android.widget.Toast.makeText(context, message, android.widget.Toast.LENGTH_SHORT).show()
+        pdfViewModel.consumePageOperationMessage()
+    }
 
     val insertPdfLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -1331,21 +2158,86 @@ fun TabletEditorScreen(navController: NavController, uri: Uri, db: AppDatabase) 
 
     // Document settings dialog state
     var showDocumentSettingsDialog by remember { mutableStateOf(false) }
+    var showExportConfirmDialog by remember { mutableStateOf(false) }
+    var isExportingPdf by remember { mutableStateOf(false) }
     val paperStyle by viewModel.paperStyle.collectAsState()
+    val quickSwipeEraserEnabled by viewModel.quickSwipeEraserEnabled.collectAsState()
     if (showDocumentSettingsDialog) {
         DocumentSettingsDialog(
             documentTitle = documentTitle,
             pageCount = pageCount,
             currentPageIndex = currentPageIndex,
-            isPageOperationInProgress = isPageOperationInProgress,
             currentStyle = paperStyle,
+            currentQuickSwipeEraserEnabled = quickSwipeEraserEnabled,
+            isPageOperationInProgress = isPageOperationInProgress,
             onDismiss = { showDocumentSettingsDialog = false },
-            onConfirmStyle = { newStyle ->
-                viewModel.setPaperStyle(newStyle)
+            onConfirmStyle = { viewModel.setPaperStyle(it) },
+            onConfirmQuickSwipeEraserEnabled = {
+                viewModel.onQuickSwipeEraserEnabledChanged(it)
             },
             onInsertPdf = {
                 showDocumentSettingsDialog = false
                 insertPdfLauncher.launch(arrayOf("application/pdf"))
+            }
+        )
+    }
+
+    if (showExportConfirmDialog) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = {
+                if (!isExportingPdf) showExportConfirmDialog = false
+            },
+            title = { Text("確認輸出 PDF") },
+            text = {
+                Text(
+                    if (isExportingPdf) "正在輸出，請稍候..."
+                    else "將輸出目前文件的所有頁面與註記到 Downloads，是否繼續？"
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        if (isExportingPdf) return@TextButton
+                        isExportingPdf = true
+                        scope.launch {
+                            try {
+                                val allStrokes = withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                    db.strokeDao().getAllStrokesForDocument(uri.toString())
+                                }
+                                val allTextAnnotations = withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                    db.textAnnotationDao().getAllForDocument(uri.toString())
+                                }
+                                val allImageAnnotations = withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                    db.imageAnnotationDao().getAllForDocument(uri.toString())
+                                }
+                                com.vic.inkflow.util.PdfExporter.export(
+                                    originalPdfUri = uri,
+                                    strokes = allStrokes,
+                                    textAnnotations = allTextAnnotations,
+                                    imageAnnotations = allImageAnnotations,
+                                    context = context,
+                                    fileName = "InkFlow_${System.currentTimeMillis()}.pdf",
+                                    modelW = viewModel.modelWidth,
+                                    modelH = viewModel.modelHeight
+                                )
+                            } finally {
+                                isExportingPdf = false
+                                showExportConfirmDialog = false
+                            }
+                        }
+                    },
+                    enabled = !isExportingPdf
+                ) {
+                    Text(if (isExportingPdf) "輸出中" else "確認匯出")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { showExportConfirmDialog = false },
+                    enabled = !isExportingPdf
+                ) {
+                    Text("取消")
+                }
             }
         )
     }
@@ -1367,29 +2259,10 @@ fun TabletEditorScreen(navController: NavController, uri: Uri, db: AppDatabase) 
             onToggleStrokeWidthSlider = { showStrokeWidthSlider = !showStrokeWidthSlider },
             onHideStrokeWidthSlider = { showStrokeWidthSlider = false },
             onExport = {
-                scope.launch {
-                    val allStrokes = withContext(kotlinx.coroutines.Dispatchers.IO) {
-                        db.strokeDao().getAllStrokesForDocument(uri.toString())
-                    }
-                    val allTextAnnotations = withContext(kotlinx.coroutines.Dispatchers.IO) {
-                        db.textAnnotationDao().getAllForDocument(uri.toString())
-                    }
-                    val allImageAnnotations = withContext(kotlinx.coroutines.Dispatchers.IO) {
-                        db.imageAnnotationDao().getAllForDocument(uri.toString())
-                    }
-                    com.vic.inkflow.util.PdfExporter.export(
-                        originalPdfUri   = uri,
-                        strokes          = allStrokes,
-                        textAnnotations  = allTextAnnotations,
-                        imageAnnotations = allImageAnnotations,
-                        context          = context,
-                        fileName         = "InkFlow_${System.currentTimeMillis()}.pdf",
-                        modelW           = viewModel.modelWidth,
-                        modelH           = viewModel.modelHeight
-                    )
-                }
+                showExportConfirmDialog = true
             },
-            onDocumentSettings = { showDocumentSettingsDialog = true }
+            onDocumentSettings = { showDocumentSettingsDialog = true },
+            onToggleAiPanel = { showAiPanel = !showAiPanel }
         )
 
         AnimatedVisibility(
@@ -1412,24 +2285,49 @@ fun TabletEditorScreen(navController: NavController, uri: Uri, db: AppDatabase) 
             }
         }
 
-        // Adjust currentPageIndex after a page is deleted
-        val lastDeletedPage by pdfViewModel.lastDeletedPageIndex.collectAsState()
-        androidx.compose.runtime.LaunchedEffect(lastDeletedPage) {
-            val idx = lastDeletedPage ?: return@LaunchedEffect
-            val newPage = when {
-                currentPageIndex > idx -> (currentPageIndex - 1).coerceAtLeast(0)
-                currentPageIndex == idx -> (idx - 1).coerceAtLeast(0)
-                else -> currentPageIndex
-            }
-            currentPageIndex = newPage
-            viewModel.setActivePage(newPage)
-            sidebarListState.animateScrollToCenter(newPage)
+        // Adjust currentPageIndex after single/multi page delete.
+        val lastDeletedPages by pdfViewModel.lastDeletedPageIndices.collectAsState()
+        androidx.compose.runtime.LaunchedEffect(lastDeletedPages, pageCount) {
+            if (lastDeletedPages.isEmpty()) return@LaunchedEffect
+            val clamped = PdfViewModel.remapCurrentPageAfterDeletes(
+                currentPageIndex = currentPageIndex,
+                deletedIndices = lastDeletedPages,
+                pageCountAfter = pageCount
+            )
+            currentPageIndex = clamped
+            viewModel.setActivePage(clamped)
+            sidebarListState.animateScrollToCenter(clamped)
             pdfViewModel.consumeDeletedPageEvent()
         }
 
-        Row(Modifier.fillMaxSize()) {
-            val isFullscreen = sidebarMode == SidebarMode.FULLSCREEN
-            Sidebar(
+        androidx.compose.foundation.layout.BoxWithConstraints(Modifier.fillMaxSize()) {
+            val totalWidth = maxWidth
+            val density = androidx.compose.ui.platform.LocalDensity.current
+            
+            val collapsedWidth = 68.dp
+            val normalWidth = 160.dp
+            
+            val targetWidth = when (sidebarMode) {
+                SidebarMode.COLLAPSED -> collapsedWidth
+                SidebarMode.NORMAL -> normalWidth
+                SidebarMode.FULLSCREEN -> totalWidth
+            }
+
+            val animatableWidth = remember { androidx.compose.animation.core.Animatable(if(sidebarMode == SidebarMode.COLLAPSED) 68f else 160f) }
+            val coroutineScope = rememberCoroutineScope()
+
+            LaunchedEffect(targetWidth, totalWidth) {
+                animatableWidth.animateTo(
+                    targetValue = targetWidth.value,
+                    animationSpec = spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow)
+                )
+            }
+
+            val currentWidthDp = animatableWidth.value.dp
+
+            Row(Modifier.fillMaxSize()) {
+                Box(Modifier.width(currentWidthDp).fillMaxHeight()) {
+                    Sidebar(
                 sidebarMode = sidebarMode,
                 onModeChange = { sidebarMode = it },
                 pdfViewModel = pdfViewModel,
@@ -1453,29 +2351,65 @@ fun TabletEditorScreen(navController: NavController, uri: Uri, db: AppDatabase) 
                     }
                 },
                 onDeletePages = { indices ->
-                    scope.launch(kotlinx.coroutines.Dispatchers.IO) {
-                        // 必須從大到小刪除，才不會影響前面頁面的 index
-                        val sortedIndices = indices.sortedDescending()
-                        sortedIndices.forEach { index ->
-                            db.strokeDao().clearPage(uri.toString(), index)
-                            db.strokeDao().shiftPageIndicesDown(uri.toString(), index)
-                            db.imageAnnotationDao().deleteForPage(uri.toString(), index)
-                            db.imageAnnotationDao().shiftPageIndicesDown(uri.toString(), index)
-                            db.textAnnotationDao().deleteForPage(uri.toString(), index)
-                            db.textAnnotationDao().shiftPageIndicesDown(uri.toString(), index)
-                        }
-                    }
                     pdfViewModel.deletePages(uri.toString(), indices)
                 },
                 listState = sidebarListState,
-                modifier = if (isFullscreen) Modifier.fillMaxHeight().weight(1f) else Modifier.fillMaxHeight()
+                modifier = Modifier.fillMaxSize()
             )
 
-            if (!isFullscreen) {
+            // Drag Handle
+            if (sidebarMode != SidebarMode.FULLSCREEN) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.CenterEnd)
+                        .fillMaxHeight()
+                        .width(24.dp)
+                        .pointerInput(totalWidth) {
+                            detectHorizontalDragGestures(
+                                onDragEnd = {
+                                    val currentW = animatableWidth.value
+                                    val newMode = when {
+                                        currentW > (normalWidth.value + totalWidth.value) / 2 -> SidebarMode.FULLSCREEN
+                                        currentW > (collapsedWidth.value + normalWidth.value) / 2 -> SidebarMode.NORMAL
+                                        else -> SidebarMode.COLLAPSED
+                                    }
+                                    sidebarMode = newMode
+                                    coroutineScope.launch {
+                                        val tW = when (newMode) {
+                                            SidebarMode.COLLAPSED -> collapsedWidth.value
+                                            SidebarMode.NORMAL -> normalWidth.value
+                                            SidebarMode.FULLSCREEN -> totalWidth.value
+                                        }
+                                        animatableWidth.animateTo(tW, spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow))
+                                    }
+                                },
+                                onHorizontalDrag = { change, dragAmount ->
+                                    change.consume()
+                                    val deltaDp = dragAmount / density.density
+                                    val newWidth = (animatableWidth.value + deltaDp).coerceIn(collapsedWidth.value, totalWidth.value)
+                                    coroutineScope.launch { animatableWidth.snapTo(newWidth) }
+                                }
+                            )
+                        }
+                ) {
+                    Box(
+                        Modifier
+                            .align(Alignment.Center)
+                            .width(4.dp)
+                            .height(48.dp)
+                            .clip(RoundedCornerShape(2.dp))
+                            .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.3f))
+                    )
+                }
+            }
+        }
+
+        Box(Modifier.weight(1f).fillMaxHeight()) {
+            Row(Modifier.fillMaxSize()) {
                 // Left Panel: AI Parser View
                 androidx.compose.animation.AnimatedVisibility(
                     visible = showAiPanel,
-                    modifier = Modifier.weight(0.4f).fillMaxHeight()
+                    modifier = Modifier.weight(aiPanelWeight).fillMaxHeight()
                 ) {
                     AiWebPanel(
                         fileUri = aiFileUri,
@@ -1486,134 +2420,58 @@ fun TabletEditorScreen(navController: NavController, uri: Uri, db: AppDatabase) 
                     )
                 }
                 if (showAiPanel) {
-                    androidx.compose.material3.VerticalDivider(Modifier.fillMaxHeight().width(1.dp))
+                    Box(
+                        modifier = Modifier
+                            .fillMaxHeight()
+                            .width(10.dp)
+                            .background(MaterialTheme.colorScheme.surface)
+                            .pointerInput(Unit) {
+                                detectHorizontalDragGestures { change, dragAmount ->
+                                    change.consume()
+                                    val screenWidthPx = context.resources.displayMetrics.widthPixels.toFloat()
+                                    val deltaWeight = dragAmount / screenWidthPx
+                                    aiPanelWeight = (aiPanelWeight + deltaWeight).coerceIn(0.2f, 0.8f)
+                                }
+                            },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        androidx.compose.material3.VerticalDivider(
+                            modifier = Modifier.fillMaxHeight(),
+                            thickness = 0.5.dp,
+                            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+                        )
+                        Box(
+                            modifier = Modifier
+                                .width(4.dp)
+                                .height(32.dp)
+                                .clip(RoundedCornerShape(2.dp))
+                                .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.3f))
+                        )
+                    }
                 }
 
                 // Main Workspace
-                val workspaceWeight = if (showAiPanel) 0.6f else 1f
+                val workspaceWeight = if (showAiPanel) (1f - aiPanelWeight) else 1f
                 Box(Modifier.weight(workspaceWeight).fillMaxHeight()) {
                     Workspace(
                         pageIndex = currentPageIndex,
                         pdfViewModel = pdfViewModel,
                         viewModel = viewModel,
                         modifier = Modifier.fillMaxSize(),
-                        pageAspectRatio = pageAspectRatio
-                    )
-                    SidebarFloatingControls(
-                        sidebarMode = sidebarMode,
-                        onModeChange = { sidebarMode = it },
-                        modifier = Modifier.align(Alignment.CenterStart).padding(start = 4.dp)
-                    )
-                    
-                    // Selected region bubble (Extract button) over Workspace
-                    val lassoPolygon by viewModel.lassoPolygon.collectAsState()
-                    var isExtracting by remember { mutableStateOf(false) }
-
-                    androidx.compose.animation.AnimatedVisibility(
-                        visible = lassoPolygon.isNotEmpty() && !isExtracting,
-                        modifier = Modifier.align(Alignment.TopCenter).padding(top = 16.dp),
-                        enter = fadeIn() + slideInVertically(initialOffsetY = { -it }),
-                        exit = fadeOut() + slideOutVertically(targetOffsetY = { -it })
-                    ) {
-                        Surface(
-                            shape = CircleShape,
-                            color = MaterialTheme.colorScheme.primaryContainer,
-                            contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
-                            shadowElevation = 8.dp
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = "已選取區域",
-                                    style = MaterialTheme.typography.labelLarge
-                                )
-                                androidx.compose.material3.TextButton(
-                                    enabled = !isExtracting,
-                                    onClick = {
-                                        if (isExtracting) return@TextButton
-                                        isExtracting = true
-                                        scope.launch {
-                                            try {
-                                                // Snapshot source page first; page index may auto-switch after insertion.
-                                                val sourcePageIndex = currentPageIndex
-                                                val sourceBitmap = kotlinx.coroutines.withTimeoutOrNull(1200) {
-                                                    pdfViewModel.getPageBitmap(sourcePageIndex)
-                                                        .filterNotNull()
-                                                        .first()
-                                                } ?: pdfViewModel.getPageBitmap(sourcePageIndex).value
-
-                                                // Insert blank page right after source page.
-                                                val newPageIndex = sourcePageIndex + 1
-                                                pdfViewModel.insertBlankPage(context, uri.toString(), sourcePageIndex)
-
-                                                // Extract source region and place it onto the new page.
-                                                viewModel.extractRegionToNewPage(
-                                                    context = context,
-                                                    sourcePageIndex = sourcePageIndex,
-                                                    targetPageIndex = newPageIndex,
-                                                    pdfPageBitmap = sourceBitmap
-                                                )
-                                            } finally {
-                                                isExtracting = false
-                                            }
-                                        }
-                                    }
-                                ) {
-                                    Text("提取到新頁面")
-                                }
-                                TextButton(
-                                    onClick = {
-                                        isExtracting = true
-                                        scope.launch {
-                                            try {
-                                                val sourcePageIndex = currentPageIndex
-                                                val sourceBitmap = kotlinx.coroutines.withTimeoutOrNull(1200) {
-                                                    pdfViewModel.getPageBitmap(sourcePageIndex).filterNotNull().first()
-                                                } ?: pdfViewModel.getPageBitmap(sourcePageIndex).value
-
-                                                val file = viewModel.extractRegionToShareFile(
-                                                    context = context,
-                                                    sourcePageIndex = sourcePageIndex,
-                                                    pdfPageBitmap = sourceBitmap
-                                                )
-                                                if (file != null) {
-                                                    val fileUri = androidx.core.content.FileProvider.getUriForFile(
-                                                        context,
-                                                        "${context.packageName}.fileprovider",
-                                                        file
-                                                    )
-                                                    aiFileUri = fileUri
-                                                    showAiPanel = true
-                                                }
-                                            } finally {
-                                                isExtracting = false
-                                            }
-                                        }
-                                    }
-                                ) {
-                                    Text("AI 解析")
-                                }
-                                androidx.compose.material3.IconButton(
-                                    onClick = { viewModel.clearSelection() },
-                                    modifier = Modifier.size(24.dp)
-                                ) {
-                                    Icon(
-                                        Icons.Default.Close,
-                                        contentDescription = "取消選取",
-                                        modifier = Modifier.size(16.dp)
-                                    )
-                                }
-                            }
+                        pageAspectRatio = pageAspectRatio,
+                        documentUri = uri.toString(),
+                        onAiFileReady = { fileUri ->
+                            aiFileUri = fileUri
+                            showAiPanel = true
                         }
-                    }
-                }
-            }
-        }
-    }
-}
+                    )
+                } // 5 Box(Workspace)
+            } // 6 inner Row
+        } // 7 Box(weight 1f)
+        } // 8 outer Row
+        } // 9 BoxWithConstraints
+    } // 10 Column
+} // 11 TabletEditorScreen
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -1669,12 +2527,6 @@ private fun Sidebar(
             }
         )
     }
-    val animatedWidth by animateDpAsState(
-        targetValue = if (sidebarMode == SidebarMode.COLLAPSED) 68.dp else 204.dp,
-        animationSpec = tween(300),
-        label = "SidebarWidthAnimation"
-    )
-
     val isDarkSurface = MaterialTheme.colorScheme.background.luminance() < 0.5f
     val sidebarColor = if (isDarkSurface) {
         ToolbarGlassDark.copy(alpha = 0.94f)
@@ -1683,7 +2535,7 @@ private fun Sidebar(
     }
 
     Surface(
-        modifier = if (sidebarMode == SidebarMode.FULLSCREEN) modifier else modifier.width(animatedWidth),
+        modifier = modifier,
         color = sidebarColor,
         contentColor = MaterialTheme.colorScheme.onSurface,
         shadowElevation = 6.dp,
@@ -1692,6 +2544,7 @@ private fun Sidebar(
         if (sidebarMode == SidebarMode.FULLSCREEN) {
             // Fullscreen: 4-column page grid with back button
             val gridState = androidx.compose.foundation.lazy.grid.rememberLazyGridState()
+            val coroutineScope = rememberCoroutineScope()
             var dragOrder by remember(visibleIndices, thumbnailVersion) { mutableStateOf(visibleIndices) }
             val reorderState = com.vic.inkflow.util.rememberReorderableLazyGridState(
                 gridState = gridState,
@@ -1788,11 +2641,20 @@ private fun Sidebar(
                         }
                         val texts by textsFlow.collectAsState(initial = emptyList())
                         val canDrag = !showOnlyBookmarked && !isSelectionMode && !isPageOperationInProgress
-                        Box(modifier = Modifier.reorderableItem(reorderState, it).then(
+                        val currentListIndex = it
+                        Box(modifier = Modifier
+                            .let { mod -> if (reorderState.draggingItemIndex == currentListIndex) mod else mod.animateItem() }
+                            .reorderableItem(reorderState, currentListIndex)
+                            .then(
                             if (canDrag) {
                                 Modifier.clickable {
-                                    onPageSelected(index)
-                                    onModeChange(SidebarMode.NORMAL)
+                                    coroutineScope.launch {
+                                        // Keep list center in sync before leaving fullscreen,
+                                        // otherwise stale center index may snap back.
+                                        listState.scrollToCenter(index)
+                                        onPageSelected(index)
+                                        onModeChange(SidebarMode.NORMAL)
+                                    }
                                 }
                             } else {
                                 Modifier.combinedClickable(
@@ -1800,8 +2662,13 @@ private fun Sidebar(
                                         if (isSelectionMode) {
                                             if (index in selectedPages) selectedPages -= index else selectedPages += index
                                         } else {
-                                            onPageSelected(index)
-                                            onModeChange(SidebarMode.NORMAL)
+                                            coroutineScope.launch {
+                                                // Keep list center in sync before leaving fullscreen,
+                                                // otherwise stale center index may snap back.
+                                                listState.scrollToCenter(index)
+                                                onPageSelected(index)
+                                                onModeChange(SidebarMode.NORMAL)
+                                            }
                                         }
                                     },
                                     onLongClick = { 
@@ -1843,13 +2710,48 @@ private fun Sidebar(
         } else {
             // Normal / Collapsed — thumbnail list + pinned add-page footer
             Column(Modifier.fillMaxSize()) {
-                LazyColumn(
-                    state = listState,
-                    modifier = Modifier.weight(1f).fillMaxWidth(),
-                    contentPadding = PaddingValues(vertical = 16.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    items(pageCount, key = { it }) { index ->
+                val coroutineScope = rememberCoroutineScope()
+
+                androidx.compose.foundation.layout.BoxWithConstraints(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                    val halfHeight = maxHeight / 2
+                    // 當在收合模式 (30dp) 與展開模式 (70dp) 時，我們一律讓原點對齊到 item 高度的「中心」，以維持視覺的絕對置中。
+                    val approximateItemHalfHeight = if (sidebarMode == SidebarMode.NORMAL) 70.dp else 40.dp
+                    val verticalPadding = (halfHeight - approximateItemHalfHeight).coerceAtLeast(0.dp)
+
+                    // 1. 即時計算中心項目
+                    val centerItemIndex by androidx.compose.runtime.remember {
+                        androidx.compose.runtime.derivedStateOf {
+                            val layoutInfo = listState.layoutInfo
+                            if (layoutInfo.visibleItemsInfo.isEmpty()) return@derivedStateOf null
+                            val center = (layoutInfo.viewportStartOffset + layoutInfo.viewportEndOffset) / 2
+                            val centerItemInfo = layoutInfo.visibleItemsInfo.minByOrNull { item ->
+                                kotlin.math.abs((item.offset + item.size / 2) - center)
+                            }
+                            centerItemInfo?.index
+                        }
+                    }
+
+                    // 2. 只要中心項目改變，馬上同步到畫布
+                    androidx.compose.runtime.LaunchedEffect(centerItemIndex) {
+                        centerItemIndex?.let { newIndex ->
+                            if (newIndex != currentPageIndex) {
+                                onPageSelected(newIndex)
+                            }
+                        }
+                    }
+
+                    // 3. 掛載原生的 SnapFlingBehavior
+                    LazyColumn(
+                        state = listState,
+                        flingBehavior = androidx.compose.foundation.gestures.snapping.rememberSnapFlingBehavior(
+                            lazyListState = listState,
+                            snapPosition = androidx.compose.foundation.gestures.snapping.SnapPosition.Center
+                        ),
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(vertical = verticalPadding),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        items(pageCount, key = { it }) { index ->
                         val thumbFlow = androidx.compose.runtime.remember(index, thumbnailVersion) {
                             pdfViewModel.getPageThumbnail(index)
                         }
@@ -1870,7 +2772,7 @@ private fun Sidebar(
                             modifier = Modifier
                                 .padding(vertical = 8.dp)
                                 .combinedClickable(
-                                    onClick = { onPageSelected(index) },
+                                    onClick = { coroutineScope.launch { listState.animateScrollToCenter(index) }; onPageSelected(index) },
                                     onLongClick = { if (pageCount > 1 && !isPageOperationInProgress) deleteConfirmIndices = listOf(index) }
                                 ),
                             contentAlignment = Alignment.Center
@@ -1896,19 +2798,19 @@ private fun Sidebar(
                         }
                     }
                 }
+                }
                 // 固定在底部的新增頁面按鈕
-                if (sidebarMode == SidebarMode.NORMAL) {
-                    androidx.compose.material3.HorizontalDivider()
-                    // 頁面操作進行中時顯示細長進度條，給予使用者視覺回饋
-                    if (isPageOperationInProgress) {
-                        androidx.compose.material3.LinearProgressIndicator(
-                            modifier = Modifier.fillMaxWidth().height(2.dp)
-                        )
-                    }
-                    var expanded by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
-                    Box(modifier = Modifier.fillMaxWidth()) {
+                androidx.compose.material3.HorizontalDivider()
+                // 頁面操作進行中時顯示細長進度條，給予使用者視覺回饋
+                if (isPageOperationInProgress) {
+                    androidx.compose.material3.LinearProgressIndicator(
+                        modifier = Modifier.fillMaxWidth().height(2.dp)
+                    )
+                }
+                Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                    if (sidebarMode == SidebarMode.NORMAL) {
                         androidx.compose.material3.TextButton(
-                            onClick = { expanded = true },
+                            onClick = { onAddPage(currentPageIndex) },
                             enabled = !isPageOperationInProgress,
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -1922,38 +2824,17 @@ private fun Sidebar(
                             Spacer(Modifier.width(4.dp))
                             Text("新增頁面", style = MaterialTheme.typography.labelMedium)
                         }
-                        
-                        androidx.compose.material3.DropdownMenu(
-                            expanded = expanded,
-                            onDismissRequest = { expanded = false }
+                    } else {
+                        androidx.compose.material3.IconButton(
+                            onClick = { onAddPage(currentPageIndex) },
+                            enabled = !isPageOperationInProgress,
+                            modifier = Modifier.padding(vertical = 5.dp)
                         ) {
-                            androidx.compose.material3.DropdownMenuItem(
-                                text = { Text("空白紙 (Blank)") },
-                                onClick = { 
-                                    expanded = false
-                                    onAddPage(currentPageIndex) 
-                                }
-                            )
-                            androidx.compose.material3.DropdownMenuItem(
-                                text = { Text("橫線紙 (Lined)") },
-                                onClick = { 
-                                    expanded = false
-                                    onAddPage(currentPageIndex) 
-                                }
-                            )
-                            androidx.compose.material3.DropdownMenuItem(
-                                text = { Text("網格紙 (Grid)") },
-                                onClick = { 
-                                    expanded = false
-                                    onAddPage(currentPageIndex) 
-                                }
-                            )
-                            androidx.compose.material3.DropdownMenuItem(
-                                text = { Text("點狀紙 (Dotted)") },
-                                onClick = { 
-                                    expanded = false
-                                    onAddPage(currentPageIndex) 
-                                }
+                            Icon(
+                                Icons.Default.Add,
+                                contentDescription = "新增頁面",
+                                modifier = Modifier.size(24.dp),
+                                tint = MaterialTheme.colorScheme.primary
                             )
                         }
                     }
@@ -1996,38 +2877,33 @@ private fun PageThumbnail(
         }
     }
 
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        val animatedBorderWidth by animateDpAsState(
-            targetValue = if (isSelected) 2.dp else 1.dp,
-            animationSpec = tween(200),
-            label = "ThumbBorderWidth"
-        )
-        val animatedBorderColor by animateColorAsState(
-            targetValue = if (isSelected) MaterialTheme.colorScheme.primary
-                          else MaterialTheme.colorScheme.outlineVariant,
-            animationSpec = tween(250),
-            label = "ThumbBorderColor"
-        )
+    Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(vertical = 4.dp)) {
         val thumbScale by animateFloatAsState(
-            targetValue = if (isSelected) 1.06f else 1f,
+            targetValue = if (isSelected) 1.08f else 1f,
             animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessMedium),
             label = "ThumbScale"
         )
+        // Animated gradient border for selected page
+        val outlineColor = MaterialTheme.colorScheme.outlineVariant
+        val borderBrush = remember(isSelected, outlineColor) {
+            if (isSelected) Brush.linearGradient(listOf(BrandIndigo, BrandPurple))
+            else Brush.linearGradient(listOf(outlineColor, outlineColor))
+        }
         Box(
             modifier = boxModifier
                 .graphicsLayer { scaleX = thumbScale; scaleY = thumbScale }
                 .clip(RoundedCornerShape(18.dp))
                 .background(paperColor, shape = RoundedCornerShape(18.dp))
                 .border(
-                    width = animatedBorderWidth,
-                    color = animatedBorderColor,
+                    width = if (isSelected) 3.dp else 1.dp,
+                    brush = borderBrush,
                     shape = RoundedCornerShape(18.dp)
                 )
         ) {
             if (bitmap != null) {
                 Image(
                     bitmap = bitmap.asImageBitmap(),
-                    contentDescription = "Page ${pageIndex + 1}",
+                    contentDescription = null,
                     modifier = Modifier.fillMaxSize(),
                     contentScale = ContentScale.Fit
                 )
@@ -2045,12 +2921,10 @@ private fun PageThumbnail(
                 val modelH = 842f
                 val sx = size.width / modelW
                 val sy = size.height / modelH
-                
                 val bmpWidth = size.width.toInt().coerceAtLeast(1)
                 val bmpHeight = size.height.toInt().coerceAtLeast(1)
                 val cachedImage = androidx.compose.ui.graphics.ImageBitmap(bmpWidth, bmpHeight, androidx.compose.ui.graphics.ImageBitmapConfig.Argb8888)
                 val cacheCanvas = androidx.compose.ui.graphics.Canvas(cachedImage)
-                
                 val drawScope = androidx.compose.ui.graphics.drawscope.CanvasDrawScope()
                 drawScope.draw(
                     androidx.compose.ui.unit.Density(1f),
@@ -2060,88 +2934,85 @@ private fun PageThumbnail(
                 ) {
                     // --- Strokes (freehand + shapes) ---
                     strokes.forEach { swp ->
-                    val stroke = swp.stroke
-                    val strokeColor = Color(stroke.color)
-                    val alpha = if (stroke.isHighlighter) 0.4f else 1f
-                    val widthPx = stroke.strokeWidth * (if (stroke.isHighlighter) 3f else 1f) * sx
-                    val paintStyle = Stroke(width = widthPx, cap = StrokeCap.Round, join = StrokeJoin.Round)
-
-                    if (stroke.shapeType != null) {
-                        val r = Rect(
-                            stroke.boundsLeft * sx, stroke.boundsTop * sy,
-                            stroke.boundsRight * sx, stroke.boundsBottom * sy
-                        )
-                        when (stroke.shapeType) {
-                            "RECT" -> drawRect(
-                                color = strokeColor.copy(alpha = alpha),
-                                topLeft = Offset(r.left, r.top),
-                                size = Size(r.width, r.height),
-                                style = paintStyle
+                        val stroke = swp.stroke
+                        val strokeColor = Color(stroke.color)
+                        val alpha = if (stroke.isHighlighter) 0.4f else 1f
+                        val widthPx = stroke.strokeWidth * (if (stroke.isHighlighter) 3f else 1f) * sx
+                        val paintStyle = Stroke(width = widthPx, cap = StrokeCap.Round, join = StrokeJoin.Round)
+                        if (stroke.shapeType != null) {
+                            val r = Rect(
+                                stroke.boundsLeft * sx, stroke.boundsTop * sy,
+                                stroke.boundsRight * sx, stroke.boundsBottom * sy
                             )
-                            "CIRCLE" -> drawOval(
-                                color = strokeColor.copy(alpha = alpha),
-                                topLeft = Offset(r.left, r.top),
-                                size = Size(r.width, r.height),
-                                style = paintStyle
-                            )
-                            "LINE" -> if (swp.points.size >= 2) {
-                                drawLine(
+                            when (stroke.shapeType) {
+                                "RECT" -> drawRect(
                                     color = strokeColor.copy(alpha = alpha),
-                                    start = Offset(swp.points.first().x * sx, swp.points.first().y * sy),
-                                    end = Offset(swp.points.last().x * sx, swp.points.last().y * sy),
-                                    strokeWidth = widthPx,
-                                    cap = StrokeCap.Round
+                                    topLeft = Offset(r.left, r.top),
+                                    size = Size(r.width, r.height),
+                                    style = paintStyle
                                 )
+                                "CIRCLE" -> drawOval(
+                                    color = strokeColor.copy(alpha = alpha),
+                                    topLeft = Offset(r.left, r.top),
+                                    size = Size(r.width, r.height),
+                                    style = paintStyle
+                                )
+                                "LINE" -> if (swp.points.size >= 2) {
+                                    drawLine(
+                                        color = strokeColor.copy(alpha = alpha),
+                                        start = Offset(swp.points.first().x * sx, swp.points.first().y * sy),
+                                        end = Offset(swp.points.last().x * sx, swp.points.last().y * sy),
+                                        strokeWidth = widthPx,
+                                        cap = StrokeCap.Round
+                                    )
+                                }
+                                "ARROW" -> if (swp.points.size >= 2) {
+                                    val p0 = Offset(swp.points.first().x * sx, swp.points.first().y * sy)
+                                    val p1 = Offset(swp.points.last().x * sx, swp.points.last().y * sy)
+                                    drawLine(
+                                        color = strokeColor.copy(alpha = alpha),
+                                        start = p0, end = p1,
+                                        strokeWidth = widthPx, cap = StrokeCap.Round
+                                    )
+                                    thumbnailDrawArrowHead(
+                                        drawScope = this,
+                                        color = strokeColor.copy(alpha = alpha),
+                                        start = p0, end = p1, sw = widthPx
+                                    )
+                                }
                             }
-                            "ARROW" -> if (swp.points.size >= 2) {
-                                val p0 = Offset(swp.points.first().x * sx, swp.points.first().y * sy)
-                                val p1 = Offset(swp.points.last().x * sx, swp.points.last().y * sy)
-                                drawLine(
-                                    color = strokeColor.copy(alpha = alpha),
-                                    start = p0, end = p1,
-                                    strokeWidth = widthPx, cap = StrokeCap.Round
-                                )
-                                thumbnailDrawArrowHead(
-                                    drawScope = this,
-                                    color = strokeColor.copy(alpha = alpha),
-                                    start = p0, end = p1, sw = widthPx
-                                )
+                        } else {
+                            val pts = swp.points
+                            if (pts.size >= 2) {
+                                val path = androidx.compose.ui.graphics.Path()
+                                path.moveTo(pts.first().x * sx, pts.first().y * sy)
+                                for (i in 1 until pts.size) {
+                                    val p1 = pts[i - 1]; val p2 = pts[i]
+                                    path.quadraticTo(
+                                        p1.x * sx, p1.y * sy,
+                                        (p1.x + p2.x) / 2f * sx, (p1.y + p2.y) / 2f * sy
+                                    )
+                                }
+                                pts.lastOrNull()?.let { path.lineTo(it.x * sx, it.y * sy) }
+                                drawPath(path, strokeColor.copy(alpha = alpha), style = paintStyle)
                             }
                         }
-                    } else {
-                        val pts = swp.points
-                        if (pts.size >= 2) {
-                            val path = androidx.compose.ui.graphics.Path()
-                            path.moveTo(pts.first().x * sx, pts.first().y * sy)
-                            for (i in 1 until pts.size) {
-                                val p1 = pts[i - 1]; val p2 = pts[i]
-                                path.quadraticTo(
-                                    p1.x * sx, p1.y * sy,
-                                    (p1.x + p2.x) / 2f * sx, (p1.y + p2.y) / 2f * sy
+                    }
+                    // --- Image annotations ---
+                    imageAnnotations.forEach { ann ->
+                        val bmp = loadedImages[ann.uri]
+                        if (bmp != null) {
+                            drawImage(
+                                image = bmp.asImageBitmap(),
+                                dstOffset = IntOffset((ann.modelX * sx).toInt(), (ann.modelY * sy).toInt()),
+                                dstSize = IntSize(
+                                    (ann.modelWidth * sx).toInt().coerceAtLeast(1),
+                                    (ann.modelHeight * sy).toInt().coerceAtLeast(1)
                                 )
-                            }
-                            pts.lastOrNull()?.let { path.lineTo(it.x * sx, it.y * sy) }
-                            drawPath(path, strokeColor.copy(alpha = alpha), style = paintStyle)
+                            )
                         }
                     }
-                }
-
-                // --- Image annotations ---
-                imageAnnotations.forEach { ann ->
-                    val bmp = loadedImages[ann.uri]
-                    if (bmp != null) {
-                        drawImage(
-                            image = bmp.asImageBitmap(),
-                            dstOffset = IntOffset((ann.modelX * sx).toInt(), (ann.modelY * sy).toInt()),
-                            dstSize = IntSize(
-                                (ann.modelWidth * sx).toInt().coerceAtLeast(1),
-                                (ann.modelHeight * sy).toInt().coerceAtLeast(1)
-                            )
-                        )
-                    }
-                }
-
-                // --- Text annotations ---
+                    // --- Text annotations ---
                     if (textAnnotations.isNotEmpty()) {
                         drawIntoCanvas { composeCanvas ->
                             textAnnotations.forEach { ann ->
@@ -2158,7 +3029,6 @@ private fun PageThumbnail(
                         }
                     }
                 }
-                
                 onDrawBehind {
                     drawImage(cachedImage)
                 }
@@ -2176,9 +3046,24 @@ private fun PageThumbnail(
                     )
                 }
             }
+            // Centered page number box (only for selected)
+            if (isSelected) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .size(38.dp, 32.dp)
+                        .background(Color.White, RoundedCornerShape(10.dp))
+                        .border(2.dp, BrandIndigo, RoundedCornerShape(10.dp)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "${pageIndex + 1}",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = BrandIndigo
+                    )
+                }
+            }
         }
-        Spacer(Modifier.height(4.dp))
-        Text(if (isBookmarked) "🔖 Page ${pageIndex + 1}" else "Page ${pageIndex + 1}", style = MaterialTheme.typography.labelSmall)
     }
 }
 
@@ -2218,81 +3103,7 @@ private fun PageIcon(pageIndex: Int, isSelected: Boolean) {
     }
 }
 
-/** 懸浮在畫布左緣中央的控制按鈕：收合側欄 + 全螢幕頁面格（閒置 3 秒後自動淡出） */
-@Composable
-private fun SidebarFloatingControls(
-    sidebarMode: SidebarMode,
-    onModeChange: (SidebarMode) -> Unit,
-    modifier: Modifier = Modifier
-) {
-    // Every time activationCount changes, reset the 3-second idle timer
-    var activationCount by remember { mutableStateOf(0) }
-    var isActive by remember { mutableStateOf(true) }
-    val controlsAlpha by animateFloatAsState(
-        targetValue = if (isActive) 1f else 0.3f,
-        animationSpec = tween(500),
-        label = "ControlsAlpha"
-    )
-    val isDarkSurface = MaterialTheme.colorScheme.background.luminance() < 0.5f
-    // Animate container colour on dark/light switch
-    val btnContainerColor by animateColorAsState(
-        targetValue = if (isDarkSurface) ToolbarGlassDark.copy(alpha = 0.94f) else ToolbarGlassLight.copy(alpha = 0.92f),
-        animationSpec = tween(400),
-        label = "FloatingBtnColor"
-    )
-    LaunchedEffect(activationCount) {
-        isActive = true
-        delay(3000)
-        isActive = false
-    }
 
-    Column(
-        modifier = modifier.graphicsLayer { alpha = controlsAlpha },
-        verticalArrangement = Arrangement.spacedBy(6.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        // 收合 / 展開
-        androidx.compose.material3.SmallFloatingActionButton(
-            onClick = {
-                activationCount++
-                onModeChange(
-                    if (sidebarMode == SidebarMode.NORMAL) SidebarMode.COLLAPSED else SidebarMode.NORMAL
-                )
-            },
-            containerColor = btnContainerColor,
-            contentColor = MaterialTheme.colorScheme.onSurface,
-            elevation = androidx.compose.material3.FloatingActionButtonDefaults.elevation(2.dp, 2.dp)
-        ) {
-            Icon(
-                imageVector = if (sidebarMode == SidebarMode.NORMAL) Icons.Default.ChevronLeft else Icons.Default.ChevronRight,
-                contentDescription = if (sidebarMode == SidebarMode.NORMAL) "收合側欄" else "展開側欄",
-                modifier = Modifier.size(18.dp)
-            )
-        }
-        // 頁面格（只在 NORMAL 顯示）
-        androidx.compose.animation.AnimatedVisibility(
-            visible = sidebarMode == SidebarMode.NORMAL,
-            enter = fadeIn(tween(200)) + scaleIn(tween(200, easing = androidx.compose.animation.core.FastOutSlowInEasing), initialScale = 0.7f),
-            exit = fadeOut(tween(150)) + androidx.compose.animation.scaleOut(tween(150), targetScale = 0.7f)
-        ) {
-            androidx.compose.material3.SmallFloatingActionButton(
-                onClick = {
-                    activationCount++
-                    onModeChange(SidebarMode.FULLSCREEN)
-                },
-                containerColor = btnContainerColor,
-                contentColor = MaterialTheme.colorScheme.onSurface,
-                elevation = androidx.compose.material3.FloatingActionButtonDefaults.elevation(2.dp, 2.dp)
-            ) {
-                Icon(
-                    Icons.Default.Apps,
-                    contentDescription = "全螢幕頁面格",
-                    modifier = Modifier.size(18.dp)
-                )
-            }
-        }
-    }
-}
 
 
 @Composable
@@ -2301,8 +3112,12 @@ private fun Workspace(
     pdfViewModel: PdfViewModel,
     viewModel: EditorViewModel,
     modifier: Modifier = Modifier,
-    pageAspectRatio: Float = 1f / 1.414f
+    pageAspectRatio: Float = 1f / 1.414f,
+    documentUri: String,
+    onAiFileReady: (android.net.Uri) -> Unit
 ) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var scale by rememberSaveable { mutableFloatStateOf(1f) }
     var offsetX by rememberSaveable { mutableFloatStateOf(0f) }
     var offsetY by rememberSaveable { mutableFloatStateOf(0f) }
@@ -2323,10 +3138,25 @@ private fun Workspace(
     } else {
         MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.76f)
     }
+    val activeTool by viewModel.selectedTool.collectAsState()
+    val lassoPolygon by viewModel.lassoPolygon.collectAsState()
+    val lastLassoPolygon by viewModel.lastLassoPolygon.collectAsState()
+    val selectedStrokes by viewModel.selectedStrokes.collectAsState()
+    val selectedImageAnnotationIds by viewModel.selectedImageAnnotationIds.collectAsState()
+    val hasEditableSelection = selectedStrokes.isNotEmpty() || selectedImageAnnotationIds.isNotEmpty()
+    val hasPdfBaseSelection = lassoPolygon.isNotEmpty()
+    val hasSelection = hasEditableSelection || hasPdfBaseSelection
+    val activeRegionPolygon = if (lassoPolygon.isNotEmpty()) lassoPolygon else lastLassoPolygon
+    val hasRegionSnapshot = activeRegionPolygon.isNotEmpty()
+    var isExtracting by remember { mutableStateOf(false) }
 
     // Track container dimensions (pixels) to compute the fit-to-page minimum scale
     var containerWidth by remember { mutableIntStateOf(0) }
     var containerHeight by remember { mutableIntStateOf(0) }
+    var paperWidthPx by remember { mutableIntStateOf(0) }
+    var paperHeightPx by remember { mutableIntStateOf(0) }
+    var bubbleWidthPx by remember { mutableIntStateOf(0) }
+    var bubbleHeightPx by remember { mutableIntStateOf(0) }
     val minScale = remember(containerWidth, containerHeight, pageAspectRatio) {
         if (containerWidth <= 0 || containerHeight <= 0) return@remember 1f
         val cW = containerWidth.toFloat()
@@ -2343,6 +3173,84 @@ private fun Workspace(
         if (scale < minScale) scale = minScale
     }
 
+    val density = LocalDensity.current
+    val bubbleGapPx = with(density) { 12.dp.toPx() }
+    val bubbleSidePaddingPx = with(density) { 12.dp.toPx() }
+    val bubbleTopSafePx = with(density) { 12.dp.toPx() }
+    val hasSelectionState = rememberUpdatedState(hasSelection)
+    val activeToolState = rememberUpdatedState(activeTool)
+
+    val regionBoundsModel = remember(activeRegionPolygon) { polygonBounds(activeRegionPolygon) }
+    val showSelectionBubble = activeTool == Tool.LASSO && hasSelection && !isExtracting
+
+    val bubbleTargetOffset = remember(
+        regionBoundsModel,
+        paperWidthPx,
+        paperHeightPx,
+        containerWidth,
+        containerHeight,
+        scale,
+        offsetX,
+        offsetY,
+        bubbleWidthPx,
+        bubbleHeightPx,
+        bubbleGapPx,
+        bubbleSidePaddingPx,
+        bubbleTopSafePx
+    ) {
+        if (regionBoundsModel == null || paperWidthPx <= 0 || paperHeightPx <= 0 || containerWidth <= 0 || containerHeight <= 0) {
+            IntOffset(0, 0)
+        } else {
+            val paperLeft = (containerWidth - paperWidthPx) / 2f
+            val paperTop = (containerHeight - paperHeightPx) / 2f
+            val paperScaleX = paperWidthPx / viewModel.modelWidth
+            val paperScaleY = paperHeightPx / viewModel.modelHeight
+
+            val boundsBase = Rect(
+                left = paperLeft + regionBoundsModel.left * paperScaleX,
+                top = paperTop + regionBoundsModel.top * paperScaleY,
+                right = paperLeft + regionBoundsModel.right * paperScaleX,
+                bottom = paperTop + regionBoundsModel.bottom * paperScaleY
+            )
+
+            val centerX = containerWidth / 2f
+            val centerY = containerHeight / 2f
+            fun transformPoint(point: Offset): Offset {
+                val dx = point.x - centerX
+                val dy = point.y - centerY
+                return Offset(
+                    x = centerX + dx * scale + offsetX,
+                    y = centerY + dy * scale + offsetY
+                )
+            }
+
+            val transformedTopLeft = transformPoint(boundsBase.topLeft)
+            val transformedBottomRight = transformPoint(boundsBase.bottomRight)
+            val transformedBounds = Rect(
+                left = minOf(transformedTopLeft.x, transformedBottomRight.x),
+                top = minOf(transformedTopLeft.y, transformedBottomRight.y),
+                right = maxOf(transformedTopLeft.x, transformedBottomRight.x),
+                bottom = maxOf(transformedTopLeft.y, transformedBottomRight.y)
+            )
+
+            val anchorX = transformedBounds.center.x
+            val bubbleW = bubbleWidthPx.toFloat()
+            val bubbleH = bubbleHeightPx.toFloat()
+            val aboveY = transformedBounds.top - bubbleH - bubbleGapPx
+            val bubbleY = if (aboveY < bubbleTopSafePx) {
+                transformedBounds.bottom + bubbleGapPx
+            } else {
+                aboveY
+            }
+
+            val maxX = maxOf(bubbleSidePaddingPx, containerWidth.toFloat() - bubbleW - bubbleSidePaddingPx)
+            val maxY = maxOf(bubbleTopSafePx, containerHeight.toFloat() - bubbleH - bubbleTopSafePx)
+
+            val clampedX = (anchorX - bubbleW / 2f).coerceIn(bubbleSidePaddingPx, maxX)
+            val clampedY = bubbleY.coerceIn(bubbleTopSafePx, maxY)
+            IntOffset(clampedX.roundToInt(), clampedY.roundToInt())
+        }
+    }
     // pdfViewModel and LaunchedEffect(uri) are owned by TabletEditorScreen
     val pageCount by pdfViewModel.pageCount.collectAsState()
     val pageBitmapFlow = androidx.compose.runtime.remember(pageIndex, pageCount) {
@@ -2378,6 +3286,21 @@ private fun Workspace(
                     // requireUnconsumed = false: picks up events not consumed by children (InkCanvas).
                     val firstDown = awaitFirstDown(requireUnconsumed = false)
                     if (firstDown.isConsumed) return@awaitEachGesture  // InkCanvas claimed it (stylus draw)
+
+                    if (activeToolState.value == Tool.LASSO && hasSelectionState.value) {
+                        val paperRect = transformedPaperRect(
+                            containerWidth = containerWidth,
+                            containerHeight = containerHeight,
+                            paperWidthPx = paperWidthPx,
+                            paperHeightPx = paperHeightPx,
+                            scale = scale,
+                            offsetX = offsetX,
+                            offsetY = offsetY
+                        )
+                        if (paperRect == null || !paperRect.contains(firstDown.position)) {
+                            viewModel.clearSelection()
+                        }
+                    }
 
                     val touchSlop = viewConfiguration.touchSlop
                     var accZoom = 1f
@@ -2449,6 +3372,10 @@ private fun Workspace(
             modifier = Modifier
                 .fillMaxSize(0.86f)
                 .aspectRatio(pageAspectRatio, matchHeightConstraintsFirst = true)
+                .onSizeChanged {
+                    paperWidthPx = it.width
+                    paperHeightPx = it.height
+                }
                 .graphicsLayer(
                     scaleX = scale,
                     scaleY = scale,
@@ -2537,10 +3464,196 @@ private fun Workspace(
             // Ink active layer (top)
             InkCanvas(
                 modifier = Modifier.fillMaxSize(),
-                viewModel = viewModel
+                viewModel = viewModel,
+                pdfViewModel = pdfViewModel,
+                documentUri = documentUri
             )
         }
+
+        androidx.compose.animation.AnimatedVisibility(
+            visible = showSelectionBubble,
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .offset { bubbleTargetOffset },
+            enter = fadeIn(animationSpec = tween(180)) +
+                slideInVertically(
+                    animationSpec = tween(220, easing = androidx.compose.animation.core.FastOutSlowInEasing),
+                    initialOffsetY = { it / 2 }
+                ),
+            exit = fadeOut(animationSpec = tween(140)) +
+                slideOutVertically(
+                    animationSpec = tween(160, easing = androidx.compose.animation.core.FastOutLinearInEasing),
+                    targetOffsetY = { it / 3 }
+                )
+        ) {
+            Surface(
+                modifier = Modifier.onSizeChanged {
+                    bubbleWidthPx = it.width
+                    bubbleHeightPx = it.height
+                },
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.primaryContainer,
+                contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                shadowElevation = 8.dp
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = if (hasEditableSelection) "已選取物件" else "已選取 PDF 區域",
+                        style = MaterialTheme.typography.labelLarge
+                    )
+                    TextButton(
+                        enabled = !isExtracting && hasSelection && hasRegionSnapshot,
+                        onClick = {
+                            if (isExtracting || !hasSelection || !hasRegionSnapshot) return@TextButton
+                            isExtracting = true
+                            scope.launch {
+                                try {
+                                    val sourcePageIndex = pageIndex
+                                    val sourceBitmap = kotlinx.coroutines.withTimeoutOrNull(1200) {
+                                        pdfViewModel.getPageBitmap(sourcePageIndex)
+                                            .filterNotNull()
+                                            .first()
+                                    } ?: pdfViewModel.getPageBitmap(sourcePageIndex).value
+
+                                    val newPageIndex = sourcePageIndex + 1
+                                    pdfViewModel.insertBlankPage(context, documentUri, sourcePageIndex)
+
+                                    viewModel.extractRegionToNewPage(
+                                        context = context,
+                                        sourcePageIndex = sourcePageIndex,
+                                        targetPageIndex = newPageIndex,
+                                        pdfPageBitmap = sourceBitmap
+                                    )
+                                } finally {
+                                    isExtracting = false
+                                }
+                            }
+                        }
+                    ) {
+                        Text("提取到新頁面")
+                    }
+                    TextButton(
+                        enabled = !isExtracting && hasSelection && hasRegionSnapshot,
+                        onClick = {
+                            if (isExtracting || !hasSelection || !hasRegionSnapshot) return@TextButton
+                            isExtracting = true
+                            scope.launch {
+                                try {
+                                    val sourcePageIndex = pageIndex
+                                    val sourceBitmap = kotlinx.coroutines.withTimeoutOrNull(1200) {
+                                        pdfViewModel.getPageBitmap(sourcePageIndex).filterNotNull().first()
+                                    } ?: pdfViewModel.getPageBitmap(sourcePageIndex).value
+
+                                    val file = viewModel.extractRegionToShareFile(
+                                        context = context,
+                                        sourcePageIndex = sourcePageIndex,
+                                        pdfPageBitmap = sourceBitmap
+                                    )
+                                    if (file != null) {
+                                        val fileUri = androidx.core.content.FileProvider.getUriForFile(
+                                            context,
+                                            "${context.packageName}.fileprovider",
+                                            file
+                                        )
+                                        onAiFileReady(fileUri)
+                                    }
+                                } finally {
+                                    isExtracting = false
+                                }
+                            }
+                        }
+                    ) {
+                        Text("AI 解析")
+                    }
+                    TextButton(
+                        enabled = hasEditableSelection,
+                        onClick = {
+                            if (!hasEditableSelection) return@TextButton
+                            viewModel.copySelectionInPlace()
+                        }
+                    ) {
+                        Text("複製")
+                    }
+                    TextButton(
+                        enabled = hasEditableSelection,
+                        onClick = {
+                            if (!hasEditableSelection) return@TextButton
+                            viewModel.deleteSelection()
+                        },
+                        colors = ButtonDefaults.textButtonColors(
+                            contentColor = MaterialTheme.colorScheme.error
+                        )
+                    ) {
+                        Text("刪除")
+                    }
+                    IconButton(
+                        onClick = { viewModel.clearSelection() },
+                        modifier = Modifier.size(24.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.Close,
+                            contentDescription = "取消選取",
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                }
+            }
+        }
     }
+}
+
+private fun polygonBounds(points: List<Offset>): Rect? {
+    if (points.isEmpty()) return null
+    val minX = points.minOf { it.x }
+    val minY = points.minOf { it.y }
+    val maxX = points.maxOf { it.x }
+    val maxY = points.maxOf { it.y }
+    if (maxX <= minX || maxY <= minY) return null
+    return Rect(minX, minY, maxX, maxY)
+}
+
+private fun transformedPaperRect(
+    containerWidth: Int,
+    containerHeight: Int,
+    paperWidthPx: Int,
+    paperHeightPx: Int,
+    scale: Float,
+    offsetX: Float,
+    offsetY: Float
+): Rect? {
+    if (containerWidth <= 0 || containerHeight <= 0 || paperWidthPx <= 0 || paperHeightPx <= 0) {
+        return null
+    }
+    val paperLeft = (containerWidth - paperWidthPx) / 2f
+    val paperTop = (containerHeight - paperHeightPx) / 2f
+    val baseRect = Rect(
+        left = paperLeft,
+        top = paperTop,
+        right = paperLeft + paperWidthPx,
+        bottom = paperTop + paperHeightPx
+    )
+    val centerX = containerWidth / 2f
+    val centerY = containerHeight / 2f
+    fun transformPoint(point: Offset): Offset {
+        val dx = point.x - centerX
+        val dy = point.y - centerY
+        return Offset(
+            x = centerX + dx * scale + offsetX,
+            y = centerY + dy * scale + offsetY
+        )
+    }
+    val transformedTopLeft = transformPoint(baseRect.topLeft)
+    val transformedBottomRight = transformPoint(baseRect.bottomRight)
+    return Rect(
+        left = minOf(transformedTopLeft.x, transformedBottomRight.x),
+        top = minOf(transformedTopLeft.y, transformedBottomRight.y),
+        right = maxOf(transformedTopLeft.x, transformedBottomRight.x),
+        bottom = maxOf(transformedTopLeft.y, transformedBottomRight.y)
+    )
 }
 
 
@@ -2553,7 +3666,8 @@ fun TabletEditorTopBar(
     onToggleStrokeWidthSlider: () -> Unit = {},
     onHideStrokeWidthSlider: () -> Unit = {},
     onExport: () -> Unit = {},
-    onDocumentSettings: () -> Unit = {}
+    onDocumentSettings: () -> Unit = {},
+    onToggleAiPanel: () -> Unit = {}
 ) {
     val activeTool by viewModel.selectedTool.collectAsState()
     val selectedColor by viewModel.selectedColor.collectAsState()
@@ -2973,6 +4087,13 @@ fun TabletEditorTopBar(
                             )
                         }
                     }
+                    IconButton(onClick = onToggleAiPanel, modifier = Modifier.size(utilityButtonSize)) {
+                        Icon(
+                            painter = painterResource(id = R.drawable.ic_gemini),
+                            contentDescription = "Toggle AI Panel",
+                            tint = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
                     IconButton(onClick = onDocumentSettings, modifier = Modifier.size(utilityButtonSize)) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.Article,
@@ -3011,12 +4132,15 @@ private fun DocumentSettingsDialog(
     pageCount: Int,
     currentPageIndex: Int,
     currentStyle: PaperStyle,
+    currentQuickSwipeEraserEnabled: Boolean,
     isPageOperationInProgress: Boolean,
     onDismiss: () -> Unit,
     onConfirmStyle: (PaperStyle) -> Unit,
+    onConfirmQuickSwipeEraserEnabled: (Boolean) -> Unit,
     onInsertPdf: () -> Unit
 ) {
     var selectedBackground by remember { mutableStateOf(currentStyle.background) }
+    var selectedQuickSwipeEraserEnabled by remember { mutableStateOf(currentQuickSwipeEraserEnabled) }
 
     androidx.compose.material3.AlertDialog(
         onDismissRequest = onDismiss,
@@ -3050,6 +4174,35 @@ private fun DocumentSettingsDialog(
                             text = "共 $pageCount 頁，目前第 ${currentPageIndex + 1} 頁",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    shape = RoundedCornerShape(20.dp)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Text("快速滑動擦除", style = MaterialTheme.typography.titleSmall)
+                            Text(
+                                text = "使用畫筆、螢光筆或圖形時，快速揮掃會自動判定為橡皮擦。",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = selectedQuickSwipeEraserEnabled,
+                            onCheckedChange = { selectedQuickSwipeEraserEnabled = it }
                         )
                     }
                 }
@@ -3127,6 +4280,7 @@ private fun DocumentSettingsDialog(
         confirmButton = {
             androidx.compose.material3.TextButton(onClick = {
                 onConfirmStyle(currentStyle.copy(background = selectedBackground))
+                onConfirmQuickSwipeEraserEnabled(selectedQuickSwipeEraserEnabled)
                 onDismiss()
             }) { Text("確認") }
         },
@@ -3326,11 +4480,11 @@ private suspend fun LazyListState.scrollToCenter(index: Int) {
 /** Animated scroll so [index] is vertically centered in the sidebar. */
 
 private suspend fun androidx.compose.foundation.lazy.LazyListState.animateScrollToCenter(index: Int) {
-    scrollToItem(index)
-    val itemInfo = layoutInfo.visibleItemsInfo.firstOrNull { it.index == index } ?: return
-    val viewportHeight = layoutInfo.viewportEndOffset - layoutInfo.viewportStartOffset
-    val delta = (itemInfo.offset + itemInfo.size / 2 - viewportHeight / 2).toFloat()
-    animateScrollBy(delta)
+    if (isScrollInProgress) return // 如果使用者正在滑動，不要強制中斷它
+    // 因為我們已經為側邊欄設定了精確的 verticalPadding (約為螢幕一半)
+    // 所以原生 animateScrollToItem(index) 將項目對齊到 content padding 邊緣時，
+    // 就剛好會落在螢幕的正中央！不需再做二次位移。
+    animateScrollToItem(index)
 }
 
 
@@ -3341,100 +4495,172 @@ fun AiWebPanel(
     modifier: androidx.compose.ui.Modifier = androidx.compose.ui.Modifier
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
-    var bitmap by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
-    
-    androidx.compose.runtime.LaunchedEffect(fileUri) {
-        if (fileUri != null) {
-            try {
-                val b = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
-                    val source = android.graphics.ImageDecoder.createSource(context.contentResolver, fileUri)
-                    android.graphics.ImageDecoder.decodeBitmap(source)
-                } else {
-                    @Suppress("DEPRECATION")
-                    android.provider.MediaStore.Images.Media.getBitmap(context.contentResolver, fileUri)
-                }
-                bitmap = b.copy(android.graphics.Bitmap.Config.ARGB_8888, true).asImageBitmap()
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-        } else {
-            bitmap = null
+    var webView by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf<android.webkit.WebView?>(null) }
+    val currentFileUri = androidx.compose.runtime.rememberUpdatedState(fileUri)
+    val uploadState = androidx.compose.runtime.remember { 
+        object {
+            var lastProcessedUri: android.net.Uri? = null
+            var isPageLoaded: Boolean = false
         }
     }
-
+    
     androidx.compose.foundation.layout.Box(
         modifier = modifier
             .fillMaxSize()
             .background(androidx.compose.material3.MaterialTheme.colorScheme.surface)
     ) {
-        androidx.compose.foundation.layout.Column(
-            modifier = androidx.compose.ui.Modifier.padding(16.dp).fillMaxSize()
+        androidx.compose.ui.viewinterop.AndroidView(
+            factory = { ctx ->
+                android.webkit.WebView(ctx).apply {
+                    // 重要：手動設置 LayoutParams 填滿父容器，避免 Compose 與 WebView 測量時發生高度坍塌(黑畫面主因之一)
+                    layoutParams = android.view.ViewGroup.LayoutParams(
+                        android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                        android.view.ViewGroup.LayoutParams.MATCH_PARENT
+                    )
+                    
+                    webView = this
+                    settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        databaseEnabled = true
+                        allowFileAccess = true
+                        
+                        // 側邊欄空間狹窄，不可開啟 WideViewPort，這會讓 Gemini 用寬視圖塞進窄空間導致內容消失跑版
+                        useWideViewPort = false
+                        loadWithOverviewMode = false
+                        
+                        // 啟用縮放但隱藏縮放按鈕
+                        builtInZoomControls = true
+                        displayZoomControls = false
+                        setSupportMultipleWindows(false)
+                        mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                        mediaPlaybackRequiresUserGesture = false
+                        
+                        // 解決 Gemini 輸入框消失與黑畫面問題：
+                        // 回歸手機版瀏覽器 UA，但把 WebView 的特徵 (wv / Version/4.0) 抹除，以繞過 Google OAuth 阻擋。
+                        val baseAgent = android.webkit.WebSettings.getDefaultUserAgent(ctx)
+                        userAgentString = baseAgent.replace("; wv", "").replace(" wv", "").replace("Version/4.0 ", "")
+                    }
+                    
+                    // 啟用 Cookie 以確保能正常登入並保持登入狀態
+                    val cookieManager = android.webkit.CookieManager.getInstance()
+                    cookieManager.setAcceptCookie(true)
+                    cookieManager.setAcceptThirdPartyCookies(this, true)
+                    
+                    webChromeClient = object : android.webkit.WebChromeClient() {
+                        override fun onShowFileChooser(
+                            webView: android.webkit.WebView?,
+                            filePathCallback: android.webkit.ValueCallback<Array<android.net.Uri>>?,
+                            fileChooserParams: FileChooserParams?
+                        ): Boolean {
+                            if (currentFileUri.value != null) {
+                                filePathCallback?.onReceiveValue(arrayOf(currentFileUri.value!!))
+                                return true
+                            }
+                            return super.onShowFileChooser(webView, filePathCallback, fileChooserParams)
+                        }
+                    }
+
+                    webViewClient = object : android.webkit.WebViewClient() {
+                        override fun shouldOverrideUrlLoading(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): Boolean {
+                            // 讓 WebView 內部處理跳轉，不觸發外部瀏覽器
+                            return false
+                        }
+
+                        override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
+                            super.onPageFinished(view, url)
+                            if (url?.contains("gemini.google.com") == true) {
+                                uploadState.isPageLoaded = true
+                                val uri = currentFileUri.value
+                                // 第一次載入完成時觸發，如果從未被處理過。
+                                if (uri != null && uri != uploadState.lastProcessedUri) {
+                                    uploadState.lastProcessedUri = uri
+                                    // Inject JavaScript to automatically trigger the file input click
+                                    val js = """
+                                        (function() {
+                                            var attempts = 0;
+                                            var interval = setInterval(function() {
+                                                var fileInput = document.querySelector('input[type="file"]');
+                                                if (fileInput) {
+                                                    fileInput.click();
+                                                    clearInterval(interval);
+                                                }
+                                                attempts++;
+                                                if (attempts >= 20) clearInterval(interval); // 最多分10秒(20*0.5s)去尋找
+                                            }, 500);
+                                        })();
+                                    """.trimIndent()
+                                    view?.evaluateJavascript(js, null)
+                                }
+                            }
+                        }
+                    }
+
+                    loadUrl("https://gemini.google.com/app")
+                }
+            },
+            update = { view ->
+                // 當外部 fileUri 更新(如使用者再次點擊 AI 解析)時，若這沒被處理過，就直接對已開啟的網頁下指令。
+                if (uploadState.isPageLoaded && fileUri != null && fileUri != uploadState.lastProcessedUri) {
+                    uploadState.lastProcessedUri = fileUri
+                    val js = """
+                        (function() {
+                            var attempts = 0;
+                            var interval = setInterval(function() {
+                                var fileInput = document.querySelector('input[type="file"]');
+                                if (fileInput) {
+                                    fileInput.click();
+                                    clearInterval(interval);
+                                }
+                                attempts++;
+                                if (attempts >= 10) clearInterval(interval); // 5秒內沒找到就放棄
+                            }, 500);
+                        })();
+                    """.trimIndent()
+                    view.evaluateJavascript(js, null)
+                }
+            },
+            modifier = androidx.compose.ui.Modifier.fillMaxSize()
+        )
+
+        // 懸浮的半透明關閉按鈕
+        androidx.compose.material3.IconButton(
+            onClick = onClose,
+            modifier = androidx.compose.ui.Modifier
+                .align(androidx.compose.ui.Alignment.TopEnd)
+                .padding(16.dp)
+                .background(
+                    color = androidx.compose.material3.MaterialTheme.colorScheme.surface.copy(alpha = 0.6f),
+                    shape = androidx.compose.foundation.shape.CircleShape
+                )
         ) {
-            androidx.compose.foundation.layout.Row(
-                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
-                horizontalArrangement = androidx.compose.foundation.layout.Arrangement.SpaceBetween,
-                modifier = androidx.compose.ui.Modifier.fillMaxWidth()
-            ) {
-                androidx.compose.material3.Text(
-                    text = "AI 解析",
-                    style = androidx.compose.material3.MaterialTheme.typography.titleMedium
-                )
-                androidx.compose.material3.IconButton(onClick = onClose) {
-                    androidx.compose.material3.Icon(
-                        imageVector = androidx.compose.material.icons.Icons.Default.Close,
-                        contentDescription = "Close"
-                    )
-                }
-            }
-            androidx.compose.material3.HorizontalDivider()
-            androidx.compose.foundation.layout.Spacer(modifier = androidx.compose.ui.Modifier.height(16.dp))
-            
-            if (bitmap != null) {
-                androidx.compose.foundation.Image(
-                    bitmap = bitmap!!,
-                    contentDescription = "Selected Region",
-                    modifier = androidx.compose.ui.Modifier
-                        .fillMaxWidth()
-                        .weight(1f)
-                        .clip(androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
-                        .border(1.dp, androidx.compose.material3.MaterialTheme.colorScheme.outlineVariant, androidx.compose.foundation.shape.RoundedCornerShape(8.dp)),
-                    contentScale = androidx.compose.ui.layout.ContentScale.Fit
-                )
-            } else {
-                androidx.compose.foundation.layout.Box(
-                    modifier = androidx.compose.ui.Modifier.fillMaxWidth().weight(1f),
-                    contentAlignment = androidx.compose.ui.Alignment.Center
-                ) {
-                    androidx.compose.material3.Text(
-                        text = if (fileUri != null) "載入圖片中..." else "沒有選取圖片",
-                        style = androidx.compose.material3.MaterialTheme.typography.bodyMedium,
-                        color = androidx.compose.material3.MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
-            
-            androidx.compose.foundation.layout.Spacer(modifier = androidx.compose.ui.Modifier.height(16.dp))
-            androidx.compose.material3.Button(
-                onClick = { /* TODO */ },
-                modifier = androidx.compose.ui.Modifier.fillMaxWidth()
-            ) {
-                androidx.compose.material3.Text("開始解析")
-            }
+            androidx.compose.material3.Icon(
+                imageVector = androidx.compose.material.icons.Icons.Default.Close,
+                contentDescription = "Close",
+                tint = androidx.compose.material3.MaterialTheme.colorScheme.onSurface
+            )
         }
     }
 }
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun DocumentListRow(
     document: DocumentEntity,
     coverBitmap: Bitmap?,
+    availableFolders: List<FolderEntity>,
     onClick: () -> Unit,
     onDelete: () -> Unit,
     onRename: (String) -> Unit = {},
-    onFavoriteToggle: (Boolean) -> Unit = {}
+    onFavoriteToggle: (Boolean) -> Unit = {},
+    onMoveToFolder: (String?) -> Unit = {},
+    onCreateFolder: (String) -> Unit = {}
 ) {
     var showRenameDialog by remember { mutableStateOf(false) }
     var showDeleteDialog by remember { mutableStateOf(false) }
+    var showMoveDialog by remember { mutableStateOf(false) }
+    var showCreateFolderDialog by remember { mutableStateOf(false) }
     var renameInput by remember(document.displayName) { mutableStateOf(document.displayName) }
+    var folderInput by remember { mutableStateOf("") }
     val isDarkSurface = MaterialTheme.colorScheme.background.luminance() < 0.5f
     val rowShellColor = if (isDarkSurface) {
         MaterialTheme.colorScheme.surface.copy(alpha = 0.84f)
@@ -3449,7 +4675,10 @@ private fun DocumentListRow(
 
     androidx.compose.material3.Surface(
         onClick = onClick,
-        modifier = Modifier.fillMaxWidth().height(88.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(88.dp)
+            .documentDragSource(document.uri),
         shape = androidx.compose.foundation.shape.RoundedCornerShape(16.dp),
         color = rowShellColor,
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)),
@@ -3518,6 +4747,22 @@ private fun DocumentListRow(
                     onDismissRequest = { showMenu = false }
                 ) {
                     androidx.compose.material3.DropdownMenuItem(
+                        text = { Text("移到資料夾") },
+                        leadingIcon = { Icon(Icons.Default.Folder, contentDescription = null) },
+                        onClick = {
+                            showMenu = false
+                            showMoveDialog = true
+                        }
+                    )
+                    androidx.compose.material3.DropdownMenuItem(
+                        text = { Text("新增資料夾") },
+                        leadingIcon = { Icon(Icons.Default.Add, contentDescription = null) },
+                        onClick = {
+                            showMenu = false
+                            showCreateFolderDialog = true
+                        }
+                    )
+                    androidx.compose.material3.DropdownMenuItem(
                         text = { Text("重新命名") },
                         leadingIcon = { Icon(Icons.Default.Create, contentDescription = null) },
                         onClick = {
@@ -3537,6 +4782,79 @@ private fun DocumentListRow(
                 }
             }
         }
+    }
+
+    if (showMoveDialog) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { showMoveDialog = false },
+            title = { Text("移到資料夾") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = {
+                        onMoveToFolder(null)
+                        showMoveDialog = false
+                    }) {
+                        Text("設為未分類")
+                    }
+                    if (availableFolders.isEmpty()) {
+                        Text(
+                            text = "尚未建立資料夾",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    } else {
+                        availableFolders.forEach { folder ->
+                            TextButton(onClick = {
+                                onMoveToFolder(folder.id)
+                                showMoveDialog = false
+                            }) {
+                                Text(folder.name)
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showMoveDialog = false
+                    showCreateFolderDialog = true
+                }) { Text("新增資料夾") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showMoveDialog = false }) { Text("關閉") }
+            }
+        )
+    }
+
+    if (showCreateFolderDialog) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { showCreateFolderDialog = false },
+            title = { Text("建立資料夾") },
+            text = {
+                androidx.compose.material3.OutlinedTextField(
+                    value = folderInput,
+                    onValueChange = { folderInput = it },
+                    singleLine = true,
+                    label = { Text("資料夾名稱") }
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val name = folderInput.trim()
+                        if (name.isNotEmpty()) {
+                            onCreateFolder(name)
+                            folderInput = ""
+                            showCreateFolderDialog = false
+                        }
+                    },
+                    enabled = folderInput.trim().isNotEmpty()
+                ) { Text("建立") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showCreateFolderDialog = false }) { Text("取消") }
+            }
+        )
     }
 
     if (showRenameDialog) {

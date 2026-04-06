@@ -6,6 +6,12 @@ import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -34,6 +40,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.graphics.ImageBitmapConfig
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
@@ -59,6 +66,7 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
@@ -73,18 +81,27 @@ import com.vic.inkflow.util.PalmRejectionFilter
 import com.vic.inkflow.util.TouchEventLogger
 import com.vic.inkflow.util.EnvelopeUtils
 import com.vic.inkflow.util.StrokePoint
+import com.vic.inkflow.util.StrokeTransformUtils
 import java.util.UUID
 import android.view.MotionEvent
 import androidx.compose.ui.input.pointer.pointerInteropFilter
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.withContext
+import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.sin
 
 private const val ENABLE_PALM_DEBUG_LOGS = false
+private val QUICK_SWIPE_MIN_TRAVEL_DISTANCE = 96.dp
+private const val QUICK_SWIPE_MAX_DURATION_MS = 320L
+private const val QUICK_SWIPE_MIN_PATH_VELOCITY_DP_PER_MS = 0.42f
+private val QUICK_SWIPE_DIRECTION_DELTA = 10.dp
+private const val QUICK_SWIPE_MIN_DIRECTION_REVERSALS = 1
 
 private fun palmDebugLog(message: String) {
     if (ENABLE_PALM_DEBUG_LOGS) {
@@ -92,11 +109,67 @@ private fun palmDebugLog(message: String) {
     }
 }
 
+private fun countDirectionReversals(points: List<Offset>, minStepPx: Float): Int {
+    if (points.size < 3) return 0
+
+    var minX = Float.POSITIVE_INFINITY
+    var maxX = Float.NEGATIVE_INFINITY
+    var minY = Float.POSITIVE_INFINITY
+    var maxY = Float.NEGATIVE_INFINITY
+    points.forEach { p ->
+        if (p.x < minX) minX = p.x
+        if (p.x > maxX) maxX = p.x
+        if (p.y < minY) minY = p.y
+        if (p.y > maxY) maxY = p.y
+    }
+
+    val useX = (maxX - minX) >= (maxY - minY)
+    var previousSign = 0
+    var reversals = 0
+    for (i in 1 until points.size) {
+        val delta = if (useX) points[i].x - points[i - 1].x else points[i].y - points[i - 1].y
+        if (abs(delta) < minStepPx) continue
+        val sign = if (delta > 0f) 1 else -1
+        if (previousSign != 0 && sign != previousSign) {
+            reversals++
+        }
+        previousSign = sign
+    }
+    return reversals
+}
+
+private fun shouldTriggerQuickSwipeEraser(
+    points: List<Offset>,
+    elapsedMs: Long,
+    density: Density
+): Boolean {
+    if (points.size < 4) return false
+    if (elapsedMs <= 0L || elapsedMs > QUICK_SWIPE_MAX_DURATION_MS) return false
+
+    var pathLengthPx = 0f
+    for (i in 1 until points.size) {
+        pathLengthPx += hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y)
+    }
+
+    val minTravelPx = with(density) { QUICK_SWIPE_MIN_TRAVEL_DISTANCE.toPx() }
+    if (pathLengthPx < minTravelPx) return false
+
+    val minVelocityPxPerMs = with(density) { QUICK_SWIPE_MIN_PATH_VELOCITY_DP_PER_MS.dp.toPx() }
+    val pathVelocityPxPerMs = pathLengthPx / elapsedMs.toFloat()
+    if (pathVelocityPxPerMs < minVelocityPxPerMs) return false
+
+    val minDirectionStepPx = with(density) { QUICK_SWIPE_DIRECTION_DELTA.toPx() }
+    val directionReversals = countDirectionReversals(points, minDirectionStepPx)
+    return directionReversals >= QUICK_SWIPE_MIN_DIRECTION_REVERSALS
+}
+
 @OptIn(ExperimentalComposeUiApi::class, ExperimentalLayoutApi::class)
 @Composable
 fun InkCanvas(
     modifier: Modifier,
-    viewModel: EditorViewModel
+    viewModel: EditorViewModel,
+    pdfViewModel: PdfViewModel,
+    documentUri: String
 ) {
     val committedStrokes by viewModel.currentStrokes.collectAsState()
     val selectedStrokePreview by viewModel.selectedStrokePreview.collectAsState()
@@ -107,10 +180,26 @@ fun InkCanvas(
     val strokeWidth by viewModel.strokeWidth.collectAsState()
     val selectedShapeSubType by viewModel.selectedShapeSubType.collectAsState()
     val selectedLassoSubType by viewModel.selectedLassoSubType.collectAsState()
+    val selectionFramePolygon by viewModel.selectionFramePolygon.collectAsState()
+    val lassoMoveOffset by viewModel.lassoMoveOffset.collectAsState()
+    val selectedStrokeScale by viewModel.selectedStrokeScale.collectAsState()
+    val selectedStrokeResizeAnchor by viewModel.selectedStrokeResizeAnchor.collectAsState()
     val inputMode by viewModel.inputMode.collectAsState()
+    val quickSwipeEraserEnabled by viewModel.quickSwipeEraserEnabled.collectAsState()
     val textAnnotations by viewModel.currentTextAnnotations.collectAsState()
     val imageAnnotations by viewModel.currentImageAnnotations.collectAsState()
+    val selectedImageAnnotationIds by viewModel.selectedImageAnnotationIds.collectAsState()
     val paperStyle by viewModel.paperStyle.collectAsState()
+    val lassoFrameTransition = rememberInfiniteTransition(label = "lasso-frame")
+    val lassoDashPhase by lassoFrameTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 20f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 900, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "lasso-dash-phase"
+    )
 
     val density = LocalDensity.current
     val context = LocalContext.current
@@ -154,33 +243,107 @@ fun InkCanvas(
     val imageAnnotationsRef    = rememberUpdatedState(imageAnnotations)
     val selectedImageIdRef     = rememberUpdatedState(selectedImageAnnotationId)
     val selectedStrokePreviewBoundsRef = rememberUpdatedState(selectedStrokePreviewBounds)
+    val selectionFramePolygonRef = rememberUpdatedState(selectionFramePolygon)
+    val lassoMoveOffsetRef = rememberUpdatedState(lassoMoveOffset)
+    val selectedStrokeScaleRef = rememberUpdatedState(selectedStrokeScale)
+    val selectedStrokeResizeAnchorRef = rememberUpdatedState(selectedStrokeResizeAnchor)
+    val isSelectionTransforming = lassoMoveOffset != Offset.Zero || abs(selectedStrokeScale - 1f) > 0.001f
+    val selectionTransformAnchor = selectedStrokeResizeAnchor
+        ?: selectedStrokePreviewBounds?.center
+        ?: Offset.Zero
+    val selectedPathData = remember(selectedStrokePreview) {
+        selectedStrokePreview.map { swp ->
+            SelectedStrokeRenderData(
+                strokeWithPoints = swp,
+                path = if (swp.stroke.shapeType == null) swp.points.toComposePath() else null
+            )
+        }
+    }
 
     // Image bitmap cache: uri-string → decoded Bitmap (null = load failed / placeholder)
     val loadedImages = remember { mutableStateMapOf<String, android.graphics.Bitmap?>() }
 
     // Image picker launcher — gallery opens on empty-canvas tap (IMAGE tool)
     val imagePickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.PickVisualMedia()
-    ) { uri ->
-        if (uri != null) {
-            scope.launch(Dispatchers.IO) {
-                // Copy to app-private storage so the image survives gallery deletion.
-                val localUri = com.vic.inkflow.util.PdfManager.copyImageToAppDir(context, uri)
-                    ?: return@launch  // copy failed — silently skip
-                // Read native dimensions without loading the full bitmap into memory.
-                val opts = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                context.contentResolver.openInputStream(localUri)?.use { stream ->
-                    android.graphics.BitmapFactory.decodeStream(stream, null, opts)
+        contract = ActivityResultContracts.PickMultipleVisualMedia(maxItems = 50)
+    ) { uris ->
+        if (uris.isEmpty()) return@rememberLauncherForActivityResult
+        scope.launch {
+            data class ImportedImage(val localUriString: String, val imagePixelWidth: Int, val imagePixelHeight: Int)
+
+            val imported = withContext(Dispatchers.IO) {
+                uris.mapNotNull { uri ->
+                    val localUri = com.vic.inkflow.util.PdfManager.copyImageToAppDir(context, uri)
+                        ?: return@mapNotNull null
+                    val opts = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                    context.contentResolver.openInputStream(localUri)?.use { stream ->
+                        android.graphics.BitmapFactory.decodeStream(stream, null, opts)
+                    }
+                    ImportedImage(
+                        localUriString = localUri.toString(),
+                        imagePixelWidth = opts.outWidth.coerceAtLeast(0),
+                        imagePixelHeight = opts.outHeight.coerceAtLeast(0)
+                    )
                 }
-                val imgW = opts.outWidth
-                val imgH = opts.outHeight
-                withContext(Dispatchers.Main) {
-                    val newId = viewModel.placeImageAnnotation(localUri.toString(), imgW, imgH)
-                    // Auto-select the freshly placed image for immediate move/resize
-                    selectedImageAnnotationId = newId
-                    imageMovePreview = Offset.Zero
-                    imageResizePreview = Offset.Zero
+            }
+
+            if (imported.isEmpty()) return@launch
+
+            suspend fun waitForInsertedPage(previousPageCount: Int): Boolean {
+                return withTimeoutOrNull(10_000) {
+                    while (pdfViewModel.pageCount.value < previousPageCount + 1) {
+                        delay(50)
+                    }
+                    true
+                } == true
+            }
+
+            var lastInsertedImageId: String? = null
+            if (imported.size == 1) {
+                val item = imported.first()
+                lastInsertedImageId = viewModel.placeImageAnnotationOnPage(
+                    uri = item.localUriString,
+                    targetPageIndex = viewModel.pageIndex.value,
+                    imagePixelWidth = item.imagePixelWidth,
+                    imagePixelHeight = item.imagePixelHeight
+                )
+            } else {
+                val currentPageIndex = viewModel.pageIndex.value
+                var insertAfterIndex = currentPageIndex
+                imported.forEachIndexed { index, item ->
+                    if (index == 0) {
+                        lastInsertedImageId = viewModel.placeImageAnnotationOnPage(
+                            uri = item.localUriString,
+                            targetPageIndex = currentPageIndex,
+                            imagePixelWidth = item.imagePixelWidth,
+                            imagePixelHeight = item.imagePixelHeight
+                        )
+                    } else {
+                        val previousPageCount = pdfViewModel.pageCount.value
+                        pdfViewModel.insertBlankPage(
+                            context = context,
+                            documentUri = documentUri,
+                            afterIndex = insertAfterIndex
+                        )
+                        val inserted = waitForInsertedPage(previousPageCount)
+                        if (!inserted) return@forEachIndexed
+
+                        val targetPageIndex = insertAfterIndex + 1
+                        lastInsertedImageId = viewModel.placeImageAnnotationOnPage(
+                            uri = item.localUriString,
+                            targetPageIndex = targetPageIndex,
+                            imagePixelWidth = item.imagePixelWidth,
+                            imagePixelHeight = item.imagePixelHeight
+                        )
+                        insertAfterIndex = targetPageIndex
+                    }
                 }
+            }
+
+            lastInsertedImageId?.let { insertedId ->
+                selectedImageAnnotationId = insertedId
+                imageMovePreview = Offset.Zero
+                imageResizePreview = Offset.Zero
             }
         }
         // Stay in IMAGE tool so the user can immediately adjust the placed image
@@ -358,7 +521,7 @@ fun InkCanvas(
             }
             false
         }
-        .pointerInput(activeTool, inputMode) {
+        .pointerInput(activeTool, inputMode, quickSwipeEraserEnabled) {
             awaitEachGesture {
                 palmDebugLog("GESTURE start - awaiting first down")
                 val firstContactDown = awaitFirstDown(requireUnconsumed = false)
@@ -686,12 +849,23 @@ fun InkCanvas(
 
                 if (activeTool == Tool.LASSO) {
                     val selectionBounds = selectedStrokePreviewBoundsRef.value
+                    val hasLassoSelection = selectedStrokePreview.isNotEmpty() ||
+                        selectedImageAnnotationIds.isNotEmpty() ||
+                        selectionFramePolygonRef.value.isNotEmpty()
                     val cs = canvasPixelSizeState.value
                     val sx = if (cs.width > 0f) cs.width / viewModel.modelWidth else 1f
                     val sy = if (cs.height > 0f) cs.height / viewModel.modelHeight else 1f
-                    val selectionRect = selectionBounds?.let {
-                        Rect(it.left * sx, it.top * sy, it.right * sx, it.bottom * sy)
-                    }
+                    val anchorModel = selectedStrokeResizeAnchorRef.value
+                        ?: selectionBounds?.center
+                        ?: Offset.Zero
+                    val selectionRect = modelTransformedPolygonBoundsToCanvasRect(
+                        polygon = selectionFramePolygonRef.value,
+                        translation = lassoMoveOffsetRef.value,
+                        scale = selectedStrokeScaleRef.value,
+                        anchor = anchorModel,
+                        sx = sx,
+                        sy = sy
+                    )
                     if (selectionRect != null && !selectionRect.isEmpty) {
                         val hitHandle = strokeSelectionHandleRects(selectionRect)
                             .firstOrNull { (_, handleRect) -> handleRect.contains(startOffset) }
@@ -732,7 +906,15 @@ fun InkCanvas(
                             return@awaitEachGesture
                         }
 
+                        down.consume()
                         viewModel.clearSelection()
+                        return@awaitEachGesture
+                    }
+
+                    if (hasLassoSelection) {
+                        down.consume()
+                        viewModel.clearSelection()
+                        return@awaitEachGesture
                     }
                 }
 
@@ -741,10 +923,15 @@ fun InkCanvas(
                     activeShapeStart = startOffset
                     activeShapeEnd   = startOffset
                     activePathVersion++
+                    val shapeGestureStartTime = down.uptimeMillis
+                    var shapeLastEventTime = down.uptimeMillis
+                    val shapeGestureTrace = mutableListOf(startOffset)
                     down.consume()
                     var drag = awaitDragOrCancellation(down.id)
                     while (drag != null && drag.pressed) {
                         activeShapeEnd = drag.position
+                        shapeGestureTrace.add(drag.position)
+                        shapeLastEventTime = drag.uptimeMillis
                         activePathVersion++
                         drag.consume()
                         drag = awaitDragOrCancellation(drag.id)
@@ -752,7 +939,22 @@ fun InkCanvas(
                     val end = activeShapeEnd
                     if (end != null) {
                         if (activeTool == Tool.SHAPE) {
-                            viewModel.saveShape(startOffset, end, selectedColor, strokeWidth)
+                            val quickSwipeTriggered = quickSwipeEraserEnabled &&
+                                shouldTriggerQuickSwipeEraser(
+                                    points = shapeGestureTrace,
+                                    elapsedMs = shapeLastEventTime - shapeGestureStartTime,
+                                    density = density
+                                )
+                            if (quickSwipeTriggered) {
+                                val points = if (startOffset == end) {
+                                    listOf(startOffset, Offset(startOffset.x + 0.01f, startOffset.y))
+                                } else {
+                                    listOf(startOffset, end)
+                                }
+                                viewModel.deleteStrokesIntersecting(points)
+                            } else {
+                                viewModel.saveShape(startOffset, end, selectedColor, strokeWidth)
+                            }
                         } else if (activeTool == Tool.LASSO) {
                             val pts = listOf(
                                 Offset(startOffset.x, startOffset.y),
@@ -775,6 +977,11 @@ fun InkCanvas(
                 activeEnvelopePath.reset()
                 
                 var lastPointTime = down.uptimeMillis
+                val gestureStartTime = down.uptimeMillis
+                val quickSwipeTrace = mutableListOf(startOffset)
+                val supportsQuickSwipeEraser = quickSwipeEraserEnabled &&
+                    (activeTool == Tool.PEN || activeTool == Tool.HIGHLIGHTER)
+                var quickSwipeTriggered = false
                 val baseWidth = if (activeTool == Tool.HIGHLIGHTER) strokeWidth * 3f else strokeWidth
                 var currentW = baseWidth
 
@@ -843,14 +1050,28 @@ fun InkCanvas(
                             activePath.quadraticBezierTo(prev.x, prev.y, (prev.x + hp.x) / 2f, (prev.y + hp.y) / 2f)
                             val w = calcWidth(hp, historical.uptimeMillis)
                             currentPathPoints.add(StrokePoint(hp.x, hp.y, w))
+                            quickSwipeTrace.add(hp)
                         }
                         val newPoint  = drag.position
                         val prevPoint = currentPathPoints.last()
                         activePath.quadraticBezierTo(prevPoint.x, prevPoint.y, (prevPoint.x + newPoint.x) / 2f, (prevPoint.y + newPoint.y) / 2f)
                         val w = calcWidth(newPoint, drag.uptimeMillis)
                         currentPathPoints.add(StrokePoint(newPoint.x, newPoint.y, w))
+                        quickSwipeTrace.add(newPoint)
+
+                        if (supportsQuickSwipeEraser && !quickSwipeTriggered) {
+                            quickSwipeTriggered = shouldTriggerQuickSwipeEraser(
+                                points = quickSwipeTrace,
+                                elapsedMs = drag.uptimeMillis - gestureStartTime,
+                                density = density
+                            )
+                            if (quickSwipeTriggered) {
+                                activePath.reset()
+                                activeEnvelopePath.reset()
+                            }
+                        }
                         
-                        if (activeTool == Tool.PEN || activeTool == Tool.HIGHLIGHTER) {
+                        if (!quickSwipeTriggered && (activeTool == Tool.PEN || activeTool == Tool.HIGHLIGHTER)) {
                             val newPath = EnvelopeUtils.generateEnvelopePath(currentPathPoints)
                             activeEnvelopePath.reset()
                             activeEnvelopePath.addPath(newPath)
@@ -859,7 +1080,7 @@ fun InkCanvas(
                         activePathVersion++
                         drag.consume()
 
-                        if (activeTool == Tool.ERASER) {
+                        if (activeTool == Tool.ERASER || quickSwipeTriggered) {
                             val points = currentPathPoints.map { Offset(it.x, it.y) }
                             viewModel.deleteStrokesIntersecting(points)
                         }
@@ -889,21 +1110,39 @@ fun InkCanvas(
 
                 when (activeTool) {
                     Tool.PEN, Tool.HIGHLIGHTER -> {
-                        // A single-point tap produces no drag points; duplicate it so
-                        // saveStroke receives ≥2 points and StrokeCap.Round renders a dot.
-                        val pts = if (currentPathPoints.size == 1)
-                            listOf(currentPathPoints[0], currentPathPoints[0])
-                        else
-                            currentPathPoints.toList()
-                        TouchEventLogger.logOutcome(
-                            sessionId       = sessionId,
-                            outcome         = "ACCEPTED",
-                            pointCount      = pts.size,
-                            maxPressure     = maxPressureDuring,
-                            maxSizeWidthPx  = maxSizeWidthDuring,
-                            maxSizeHeightPx = maxSizeHeightDuring
-                        )
-                        viewModel.saveStroke(pts, selectedColor, activeTool, strokeWidth)
+                        if (quickSwipeTriggered) {
+                            val points = if (currentPathPoints.size == 1) {
+                                val pt = currentPathPoints.first()
+                                listOf(Offset(pt.x, pt.y), Offset(pt.x + 0.01f, pt.y))
+                            } else {
+                                currentPathPoints.map { Offset(it.x, it.y) }
+                            }
+                            TouchEventLogger.logOutcome(
+                                sessionId       = sessionId,
+                                outcome         = "QUICK_SWIPE_ERASE",
+                                pointCount      = points.size,
+                                maxPressure     = maxPressureDuring,
+                                maxSizeWidthPx  = maxSizeWidthDuring,
+                                maxSizeHeightPx = maxSizeHeightDuring
+                            )
+                            viewModel.deleteStrokesIntersecting(points)
+                        } else {
+                            // A single-point tap produces no drag points; duplicate it so
+                            // saveStroke receives ≥2 points and StrokeCap.Round renders a dot.
+                            val pts = if (currentPathPoints.size == 1)
+                                listOf(currentPathPoints[0], currentPathPoints[0])
+                            else
+                                currentPathPoints.toList()
+                            TouchEventLogger.logOutcome(
+                                sessionId       = sessionId,
+                                outcome         = "ACCEPTED",
+                                pointCount      = pts.size,
+                                maxPressure     = maxPressureDuring,
+                                maxSizeWidthPx  = maxSizeWidthDuring,
+                                maxSizeHeightPx = maxSizeHeightDuring
+                            )
+                            viewModel.saveStroke(pts, selectedColor, activeTool, strokeWidth)
+                        }
                     }
                     Tool.LASSO -> {
                         activePath.close()
@@ -1016,19 +1255,34 @@ fun InkCanvas(
             currentImageAnns.forEach { ann ->
                 val bmp = loadedImages[ann.uri]
                 if (bmp != null) {
-                    val isSelected = ann.id == selectedImageAnnotationId && activeTool == Tool.IMAGE
-                    val dx = if (isSelected) imageMovePreview.x  else 0f
-                    val dy = if (isSelected) imageMovePreview.y  else 0f
-                    val dw = if (isSelected) imageResizePreview.x else 0f
-                    val dh = if (isSelected) imageResizePreview.y else 0f
-                    val canvasX = ann.modelX * sx + dx
-                    val canvasY = ann.modelY * sy + dy
-                    val canvasW = (ann.modelWidth  * sx + dw).coerceAtLeast(2f)
-                    val canvasH = (ann.modelHeight * sy + dh).coerceAtLeast(2f)
+                    val isSelectedInImageTool = ann.id == selectedImageAnnotationId && activeTool == Tool.IMAGE
+                    val isSelectedInSelectionTool = ann.id in selectedImageAnnotationIds && activeTool == Tool.LASSO
+                    val canvasRect = when {
+                        isSelectedInSelectionTool -> modelTransformedImageRectToCanvasRect(
+                            image = ann,
+                            translation = lassoMoveOffset,
+                            scale = selectedStrokeScale,
+                            anchor = selectionTransformAnchor,
+                            sx = sx,
+                            sy = sy
+                        )
+                        else -> {
+                            val dx = if (isSelectedInImageTool) imageMovePreview.x else 0f
+                            val dy = if (isSelectedInImageTool) imageMovePreview.y else 0f
+                            val dw = if (isSelectedInImageTool) imageResizePreview.x else 0f
+                            val dh = if (isSelectedInImageTool) imageResizePreview.y else 0f
+                            Rect(
+                                left = ann.modelX * sx + dx,
+                                top = ann.modelY * sy + dy,
+                                right = ann.modelX * sx + dx + (ann.modelWidth * sx + dw).coerceAtLeast(2f),
+                                bottom = ann.modelY * sy + dy + (ann.modelHeight * sy + dh).coerceAtLeast(2f)
+                            )
+                        }
+                    }
                     drawImage(
                         image     = bmp.asImageBitmap(),
-                        dstOffset = IntOffset(canvasX.toInt(), canvasY.toInt()),
-                        dstSize   = IntSize(canvasW.toInt(), canvasH.toInt())
+                        dstOffset = IntOffset(canvasRect.left.toInt(), canvasRect.top.toInt()),
+                        dstSize   = IntSize(canvasRect.width.toInt().coerceAtLeast(2), canvasRect.height.toInt().coerceAtLeast(2))
                     )
                 }
             }
@@ -1057,51 +1311,46 @@ fun InkCanvas(
             }
 
             // Selected strokes (highlighted with current preview transform applied).
-            val selectedPathData = selectedStrokePreview.map { swp ->
-                Pair(swp, swp.points.toComposePath())
-            }
             if (selectedPathData.isNotEmpty()) {
                 drawIntoCanvas { cvs ->
                     cvs.save()
                     cvs.scale(sx, sy)
-                    selectedPathData.forEach { (swp, path) ->
+                    if (isSelectionTransforming) {
+                        applySelectionTransform(
+                            canvas = cvs,
+                            translation = lassoMoveOffset,
+                            scale = selectedStrokeScale,
+                            anchor = selectionTransformAnchor
+                        )
+                    }
+                    selectedPathData.forEach { renderData ->
+                        val swp = renderData.strokeWithPoints
                         val stroke = swp.stroke
                         if (stroke.shapeType != null) {
                             drawShapeOnCanvas(cvs, stroke, swp.points, tintColor = Color(0xFF6366F1))
                         } else {
+                            val path = renderData.path ?: return@forEach
                             drawPathOnCanvas(cvs, path, Color(0xFF6366F1), stroke.strokeWidth, stroke.isHighlighter)
                         }
                     }
                     cvs.restore()
                 }
                 val previewBounds = selectedStrokePreviewBounds
-                if (activeTool == Tool.LASSO && previewBounds != null) {
-                    val selectionRect = Rect(
-                        previewBounds.left * sx,
-                        previewBounds.top * sy,
-                        previewBounds.right * sx,
-                        previewBounds.bottom * sy
+                val selectionRect = modelTransformedPolygonBoundsToCanvasRect(
+                    polygon = selectionFramePolygon,
+                    translation = lassoMoveOffset,
+                    scale = selectedStrokeScale,
+                    anchor = selectionTransformAnchor,
+                    sx = sx,
+                    sy = sy
+                )
+                if (activeTool == Tool.LASSO && selectionRect != null && !selectionRect.isEmpty) {
+                    drawLassoSelectionFrame(
+                        selectionRect = selectionRect,
+                        showHandles = selectedStrokePreview.isNotEmpty() || selectedImageAnnotationIds.isNotEmpty(),
+                        dashPhase = if (isSelectionTransforming) 0f else lassoDashPhase,
+                        animateDash = !isSelectionTransforming
                     )
-                    drawRect(
-                        color = Color(0xFF6366F1),
-                        topLeft = Offset(selectionRect.left, selectionRect.top),
-                        size = Size(selectionRect.width, selectionRect.height),
-                        style = Stroke(width = 2f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 6f)))
-                    )
-                    strokeSelectionHandleRects(selectionRect).forEach { (_, handleRect) ->
-                        drawRect(
-                            color = Color(0xFF6366F1),
-                            topLeft = Offset(handleRect.left, handleRect.top),
-                            size = Size(handleRect.width, handleRect.height)
-                        )
-                        drawLine(
-                            color = Color.White,
-                            start = Offset(handleRect.left + 5f, handleRect.bottom - 5f),
-                            end = Offset(handleRect.right - 5f, handleRect.top + 5f),
-                            strokeWidth = 1.5f,
-                            cap = StrokeCap.Round
-                        )
-                    }
                 }
             }
 
@@ -1298,6 +1547,95 @@ private enum class StrokeSelectionHandle {
     BOTTOM_RIGHT
 }
 
+private data class SelectedStrokeRenderData(
+    val strokeWithPoints: StrokeWithPoints,
+    val path: Path?
+)
+
+private const val LASSO_FRAME_CORNER_RADIUS_PX = 14f
+private const val LASSO_FRAME_OUTER_STROKE_PX = 6f
+private const val LASSO_FRAME_INNER_STROKE_PX = 2.2f
+private const val LASSO_HANDLE_VISUAL_RADIUS_PX = 8f
+private const val LASSO_HANDLE_HIT_RADIUS_PX = 14f
+private const val LASSO_HANDLE_HALO_RADIUS_PX = 12f
+private val LASSO_DASH_PATTERN = floatArrayOf(12f, 8f)
+private val LASSO_FRAME_COLOR = Color(0xFF6366F1)
+
+private fun applySelectionTransform(
+    canvas: androidx.compose.ui.graphics.Canvas,
+    translation: Offset,
+    scale: Float,
+    anchor: Offset
+) {
+    val clampedScale = StrokeTransformUtils.clampUniformScale(scale)
+    canvas.translate(anchor.x, anchor.y)
+    canvas.scale(clampedScale, clampedScale)
+    canvas.translate(-anchor.x, -anchor.y)
+    canvas.translate(translation.x, translation.y)
+}
+
+private fun DrawScope.drawLassoSelectionFrame(
+    selectionRect: Rect,
+    showHandles: Boolean,
+    dashPhase: Float,
+    animateDash: Boolean
+) {
+    val topLeft = Offset(selectionRect.left, selectionRect.top)
+    val size = Size(selectionRect.width, selectionRect.height)
+    val corner = CornerRadius(LASSO_FRAME_CORNER_RADIUS_PX, LASSO_FRAME_CORNER_RADIUS_PX)
+    val innerStroke = if (animateDash) {
+        Stroke(
+            width = LASSO_FRAME_INNER_STROKE_PX,
+            pathEffect = PathEffect.dashPathEffect(LASSO_DASH_PATTERN, dashPhase)
+        )
+    } else {
+        Stroke(width = LASSO_FRAME_INNER_STROKE_PX)
+    }
+
+    // Selection fill helps users identify the selected region quickly.
+    drawRoundRect(
+        color = LASSO_FRAME_COLOR.copy(alpha = 0.09f),
+        topLeft = topLeft,
+        size = size,
+        cornerRadius = corner
+    )
+    drawRoundRect(
+        color = LASSO_FRAME_COLOR.copy(alpha = 0.22f),
+        topLeft = topLeft,
+        size = size,
+        cornerRadius = corner,
+        style = Stroke(width = LASSO_FRAME_OUTER_STROKE_PX)
+    )
+    drawRoundRect(
+        color = LASSO_FRAME_COLOR,
+        topLeft = topLeft,
+        size = size,
+        cornerRadius = corner,
+        style = innerStroke
+    )
+
+    if (!showHandles) return
+    strokeSelectionHandleRects(selectionRect).forEach { (_, handleRect) ->
+        val center = handleRect.center
+        drawCircle(
+            color = LASSO_FRAME_COLOR.copy(alpha = 0.22f),
+            radius = LASSO_HANDLE_HALO_RADIUS_PX,
+            center = center
+        )
+        drawCircle(
+            color = Color.White,
+            radius = LASSO_HANDLE_VISUAL_RADIUS_PX,
+            center = center
+        )
+        drawCircle(
+            color = LASSO_FRAME_COLOR,
+            radius = LASSO_HANDLE_VISUAL_RADIUS_PX,
+            center = center,
+            style = Stroke(width = 2f)
+        )
+    }
+}
+
 private fun strokeSelectionHandleCenter(selectionRect: Rect, handle: StrokeSelectionHandle): Offset = when (handle) {
     StrokeSelectionHandle.TOP_LEFT -> Offset(selectionRect.left, selectionRect.top)
     StrokeSelectionHandle.TOP_RIGHT -> Offset(selectionRect.right, selectionRect.top)
@@ -1318,7 +1656,63 @@ private fun strokeSelectionHandleRects(selectionRect: Rect): List<Pair<StrokeSel
     StrokeSelectionHandle.BOTTOM_LEFT,
     StrokeSelectionHandle.BOTTOM_RIGHT
 ).map { handle ->
-    handle to imageResizeHandleRect(strokeSelectionHandleCenter(selectionRect, handle))
+    handle to strokeSelectionHandleHitRect(strokeSelectionHandleCenter(selectionRect, handle))
+}
+
+private fun strokeSelectionHandleHitRect(center: Offset): Rect = Rect(
+    left = center.x - LASSO_HANDLE_HIT_RADIUS_PX,
+    top = center.y - LASSO_HANDLE_HIT_RADIUS_PX,
+    right = center.x + LASSO_HANDLE_HIT_RADIUS_PX,
+    bottom = center.y + LASSO_HANDLE_HIT_RADIUS_PX
+)
+
+private fun modelTransformedPolygonBoundsToCanvasRect(
+    polygon: List<Offset>,
+    translation: Offset,
+    scale: Float,
+    anchor: Offset,
+    sx: Float,
+    sy: Float
+): Rect? {
+    if (polygon.isEmpty()) return null
+    val clampedScale = StrokeTransformUtils.clampUniformScale(scale)
+    var minX = Float.POSITIVE_INFINITY
+    var minY = Float.POSITIVE_INFINITY
+    var maxX = Float.NEGATIVE_INFINITY
+    var maxY = Float.NEGATIVE_INFINITY
+    polygon.forEach { point ->
+        val anchoredX = point.x - anchor.x
+        val anchoredY = point.y - anchor.y
+        val transformedX = anchor.x + anchoredX * clampedScale + translation.x
+        val transformedY = anchor.y + anchoredY * clampedScale + translation.y
+        if (transformedX < minX) minX = transformedX
+        if (transformedY < minY) minY = transformedY
+        if (transformedX > maxX) maxX = transformedX
+        if (transformedY > maxY) maxY = transformedY
+    }
+    if (maxX <= minX || maxY <= minY) return null
+    return Rect(minX * sx, minY * sy, maxX * sx, maxY * sy)
+}
+
+private fun modelTransformedImageRectToCanvasRect(
+    image: ImageAnnotationEntity,
+    translation: Offset,
+    scale: Float,
+    anchor: Offset,
+    sx: Float,
+    sy: Float
+): Rect {
+    val clampedScale = StrokeTransformUtils.clampUniformScale(scale)
+    val transformedLeft = anchor.x + (image.modelX - anchor.x) * clampedScale + translation.x
+    val transformedTop = anchor.y + (image.modelY - anchor.y) * clampedScale + translation.y
+    val transformedWidth = (image.modelWidth * clampedScale).coerceAtLeast(1f)
+    val transformedHeight = (image.modelHeight * clampedScale).coerceAtLeast(1f)
+    return Rect(
+        left = transformedLeft * sx,
+        top = transformedTop * sy,
+        right = (transformedLeft + transformedWidth) * sx,
+        bottom = (transformedTop + transformedHeight) * sy
+    )
 }
 
 // ---- Shape rendering helpers ----

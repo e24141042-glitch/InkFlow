@@ -15,6 +15,9 @@ interface DocumentDao {
     @Query("SELECT * FROM documents ORDER BY lastOpenedAt DESC")
     fun getAllDocuments(): Flow<List<DocumentEntity>>
 
+    @Query("SELECT * FROM documents")
+    suspend fun getAllDocumentsSync(): List<DocumentEntity>
+
     @Query("DELETE FROM documents WHERE uri = :uri")
     suspend fun delete(uri: String): Int
 
@@ -27,8 +30,17 @@ interface DocumentDao {
     @Query("UPDATE documents SET isFavorite = :isFavorite WHERE uri = :uri")
     suspend fun updateFavoriteStatus(uri: String, isFavorite: Boolean)
 
-    @Query("UPDATE documents SET folderName = :folderName WHERE uri = :uri")
-    suspend fun updateFolder(uri: String, folderName: String?)
+    @Query("UPDATE documents SET folderId = :folderId WHERE uri = :uri")
+    suspend fun updateFolder(uri: String, folderId: String?)
+
+    @Query("UPDATE documents SET folderId = :folderId WHERE uri IN (:uris)")
+    suspend fun moveDocumentsToFolder(uris: List<String>, folderId: String?)
+
+    @Query("UPDATE documents SET folderId = NULL WHERE folderId IN (:folderIds)")
+    suspend fun clearFolderAssignmentsInFolders(folderIds: List<String>)
+
+    @Query("UPDATE documents SET lastOpenedAt = :timestamp WHERE uri = :uri")
+    suspend fun updateLastOpenedAt(uri: String, timestamp: Long = System.currentTimeMillis())
 
     @Query("SELECT lastPageIndex FROM documents WHERE uri = :uri")
     suspend fun getLastPageIndex(uri: String): Int?

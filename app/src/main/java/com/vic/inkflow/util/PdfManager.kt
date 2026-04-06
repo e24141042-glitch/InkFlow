@@ -163,15 +163,33 @@ object PdfManager {
                 val sourceFile = File(sourceFileUri.path!!)
                 PDDocument.load(targetFile).use { targetDoc ->
                     PDDocument.load(sourceFile).use { sourceDoc ->
-                        val importedPages = (0 until sourceDoc.numberOfPages).map { index ->
-                            targetDoc.importPage(sourceDoc.getPage(index))
+                        val sourceCount = sourceDoc.numberOfPages
+                        if (sourceCount <= 0) {
+                            Log.w(TAG, "insertPdfPages: source PDF has no pages")
+                            return@use
                         }
-                        val insertionIndex = (afterIndex + 1).coerceIn(0, targetDoc.numberOfPages - importedPages.size)
-                        if (importedPages.isNotEmpty() && insertionIndex < targetDoc.numberOfPages - importedPages.size) {
-                            val anchorPage = targetDoc.getPage(insertionIndex)
-                            importedPages.asReversed().forEach { importedPage ->
-                                targetDoc.pages.insertBefore(importedPage, anchorPage)
+
+                        val insertionIndex = (afterIndex + 1).coerceIn(0, targetDoc.numberOfPages)
+                        Log.d(
+                            TAG,
+                            "insertPdfPages: targetCount=${targetDoc.numberOfPages}, sourceCount=$sourceCount, afterIndex=$afterIndex, insertionIndex=$insertionIndex"
+                        )
+
+                        // Deterministic insertion: import one page at a time and place it
+                        // directly at the next insertion slot. This avoids unstable page-tree
+                        // reordering when trying to batch-move already imported pages.
+                        var insertPos = insertionIndex
+                        repeat(sourceCount) { srcIndex ->
+                            val imported = targetDoc.importPage(sourceDoc.getPage(srcIndex))
+                            // importPage appends at tail first; remove that tail occurrence,
+                            // then insert at the intended position.
+                            targetDoc.removePage(targetDoc.numberOfPages - 1)
+                            if (insertPos < targetDoc.numberOfPages) {
+                                targetDoc.pages.insertBefore(imported, targetDoc.getPage(insertPos))
+                            } else {
+                                targetDoc.addPage(imported)
                             }
+                            insertPos++
                         }
 
                         val tmpFile = File(targetFile.parent, "${targetFile.nameWithoutExtension}.tmp_${System.currentTimeMillis()}.pdf")

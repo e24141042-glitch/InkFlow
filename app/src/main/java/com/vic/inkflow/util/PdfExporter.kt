@@ -20,6 +20,7 @@ import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import kotlin.math.atan2
 import kotlin.math.cos
+import kotlin.math.hypot
 import kotlin.math.sin
 
 /**
@@ -85,7 +86,7 @@ object PdfExporter {
                             val pageWidth  = page.mediaBox.width
 
                             pageImages?.forEach { ann ->
-                                drawImageAnnotation(contentStream, document, context, ann, pageWidth, pageHeight)
+                                drawImageAnnotation(contentStream, document, context, ann, pageWidth, pageHeight, modelW, modelH)
                             }
 
                             pageStrokes?.forEach { stroke ->
@@ -97,7 +98,7 @@ object PdfExporter {
                             }
 
                             pageTexts?.forEach { ann ->
-                                drawTextAnnotation(contentStream, document, context, ann, pageWidth, pageHeight)
+                                drawTextAnnotation(contentStream, document, context, ann, pageWidth, pageHeight, modelW, modelH)
                             }
 
                             contentStream.close()
@@ -130,46 +131,176 @@ object PdfExporter {
     }
 
     private fun drawStroke(stream: PDPageContentStream, stroke: StrokeWithPoints, pageWidth: Float, pageHeight: Float, modelW: Float = MODEL_W, modelH: Float = MODEL_H) {
-        val points = stroke.points.map { PointF(it.x, it.y) }
-        if (points.size < 2) return
+        val points = stroke.points.map {
+            val width = if (it.width > 0f) it.width else stroke.stroke.strokeWidth
+            StrokePoint(it.x, it.y, width)
+        }
+        if (points.isEmpty()) return
 
-        // Fix #1: scale model-space coords to actual PDF page dimensions.
         val ratioX = pageWidth  / modelW
         val ratioY = pageHeight / modelH
 
         val color = android.graphics.Color.valueOf(stroke.stroke.color)
-        // Fix #2 + #5: apply stroke alpha; highlighters get 40% opacity.
-        // color.alpha() already returns [0.0, 1.0] — do NOT divide by 255.
-        val strokingAlpha = if (stroke.stroke.isHighlighter) 0.4f else color.alpha()
+        val fillAlpha = if (stroke.stroke.isHighlighter) 0.4f else color.alpha()
 
-        stream.saveGraphicsState()
-        val gs = PDExtendedGraphicsState()
-        gs.setStrokingAlphaConstant(strokingAlpha)
-        stream.setGraphicsStateParameters(gs)
-        stream.setStrokingColor(color.red(), color.green(), color.blue())
-        stream.setLineWidth(stroke.stroke.strokeWidth * ratioX)
-
-        // Local helpers: model → PDF coordinate space.
         fun mx(x: Float) = x * ratioX
         fun my(y: Float) = pageHeight - y * ratioY
 
-        val firstPoint = points.first()
-        stream.moveTo(mx(firstPoint.x), my(firstPoint.y))
-
-        for (i in 1 until points.size) {
-            val p1 = points[i - 1]
-            val p2 = points[i]
-            val midPoint    = PointF((p1.x + p2.x) / 2f, (p1.y + p2.y) / 2f)
-            val startPoint  = if (i == 1) firstPoint else PointF((points[i - 2].x + p1.x) / 2f, (points[i - 2].y + p1.y) / 2f)
-            val c1x = startPoint.x + 2/3f * (p1.x - startPoint.x)
-            val c1y = startPoint.y + 2/3f * (p1.y - startPoint.y)
-            val c2x = midPoint.x   + 2/3f * (p1.x - midPoint.x)
-            val c2y = midPoint.y   + 2/3f * (p1.y - midPoint.y)
-            stream.curveTo(mx(c1x), my(c1y), mx(c2x), my(c2y), mx(midPoint.x), my(midPoint.y))
+        stream.saveGraphicsState()
+        val gs = PDExtendedGraphicsState().apply {
+            setStrokingAlphaConstant(fillAlpha)
+            setNonStrokingAlphaConstant(fillAlpha)
         }
-        stream.lineTo(mx(points.last().x), my(points.last().y))
-        stream.stroke()
+        stream.setGraphicsStateParameters(gs)
+        stream.setStrokingColor(color.red(), color.green(), color.blue())
+        stream.setNonStrokingColor(color.red(), color.green(), color.blue())
+
+        if (points.size == 1) {
+            val p = points.first()
+            drawFilledEllipsePdf(stream, mx(p.x), my(p.y), (p.width / 2f) * ratioX, (p.width / 2f) * ratioY)
+            stream.restoreGraphicsState()
+            return
+        }
+
+        val leftPoints = mutableListOf<PointF>()
+        val rightPoints = mutableListOf<PointF>()
+
+        for (i in points.indices) {
+            val curr = points[i]
+
+            var prevIndex = i - 1
+            while (prevIndex >= 0 && hypot(curr.x - points[prevIndex].x, curr.y - points[prevIndex].y) < 1f) {
+                prevIndex--
+            }
+            val prev = if (prevIndex >= 0) points[prevIndex] else curr
+
+            var nextIndex = i + 1
+            while (nextIndex < points.size && hypot(points[nextIndex].x - curr.x, points[nextIndex].y - curr.y) < 1f) {
+                nextIndex++
+            }
+            val next = if (nextIndex < points.size) points[nextIndex] else curr
+
+            var dx = next.x - prev.x
+            var dy = next.y - prev.y
+            if (prev === curr && next !== curr) {
+                dx = next.x - curr.x
+                dy = next.y - curr.y
+            } else if (next === curr && prev !== curr) {
+                dx = curr.x - prev.x
+                dy = curr.y - prev.y
+            }
+
+            val len = hypot(dx, dy)
+            if (len > 0.01f) {
+                dx /= len
+                dy /= len
+            } else {
+                dx = 1f
+                dy = 0f
+            }
+
+            val nx = -dy
+            val ny = dx
+            val r = curr.width / 2f
+            leftPoints.add(PointF(curr.x + nx * r, curr.y + ny * r))
+            rightPoints.add(PointF(curr.x - nx * r, curr.y - ny * r))
+
+            drawFilledEllipsePdf(stream, mx(curr.x), my(curr.y), r * ratioX, r * ratioY)
+        }
+
+        var curX = mx(leftPoints.first().x)
+        var curY = my(leftPoints.first().y)
+        stream.moveTo(curX, curY)
+
+        fun quadToModel(control: PointF, end: PointF) {
+            val qx = mx(control.x)
+            val qy = my(control.y)
+            val ex = mx(end.x)
+            val ey = my(end.y)
+            val c1x = curX + (2f / 3f) * (qx - curX)
+            val c1y = curY + (2f / 3f) * (qy - curY)
+            val c2x = ex + (2f / 3f) * (qx - ex)
+            val c2y = ey + (2f / 3f) * (qy - ey)
+            stream.curveTo(c1x, c1y, c2x, c2y, ex, ey)
+            curX = ex
+            curY = ey
+        }
+
+        for (i in 1 until leftPoints.size) {
+            val p1 = leftPoints[i - 1]
+            val p2 = leftPoints[i]
+            val mid = PointF((p1.x + p2.x) / 2f, (p1.y + p2.y) / 2f)
+            quadToModel(p1, mid)
+        }
+
+        val leftLast = leftPoints.last()
+        curX = mx(leftLast.x)
+        curY = my(leftLast.y)
+        stream.lineTo(curX, curY)
+
+        val endPt = points.last()
+        val endR = endPt.width / 2f
+        val endDx = leftPoints.last().x - endPt.x
+        val endDy = leftPoints.last().y - endPt.y
+        val endAngle = atan2(endDy, endDx)
+        val capSteps = 12
+        for (i in 0..capSteps) {
+            val a = endAngle - (Math.PI.toFloat() * i / capSteps)
+            curX = mx(endPt.x + cos(a) * endR)
+            curY = my(endPt.y + sin(a) * endR)
+            stream.lineTo(curX, curY)
+        }
+
+        val rightLast = rightPoints.last()
+        curX = mx(rightLast.x)
+        curY = my(rightLast.y)
+        stream.lineTo(curX, curY)
+
+        for (i in rightPoints.indices.reversed().drop(1)) {
+            val p1 = rightPoints[i + 1]
+            val p2 = rightPoints[i]
+            val mid = PointF((p1.x + p2.x) / 2f, (p1.y + p2.y) / 2f)
+            quadToModel(p1, mid)
+        }
+
+        val rightFirst = rightPoints.first()
+        curX = mx(rightFirst.x)
+        curY = my(rightFirst.y)
+        stream.lineTo(curX, curY)
+
+        val startPt = points.first()
+        val startR = startPt.width / 2f
+        val startDx = rightPoints.first().x - startPt.x
+        val startDy = rightPoints.first().y - startPt.y
+        val startAngle = atan2(startDy, startDx)
+        for (i in 0..capSteps) {
+            val a = startAngle - (Math.PI.toFloat() * i / capSteps)
+            curX = mx(startPt.x + cos(a) * startR)
+            curY = my(startPt.y + sin(a) * startR)
+            stream.lineTo(curX, curY)
+        }
+
+        stream.closePath()
+        stream.fill()
         stream.restoreGraphicsState()
+    }
+
+    private fun drawFilledEllipsePdf(
+        stream: PDPageContentStream,
+        cx: Float,
+        cy: Float,
+        rx: Float,
+        ry: Float
+    ) {
+        if (rx <= 0f || ry <= 0f) return
+        val k = 0.5522848f
+        stream.moveTo(cx, cy + ry)
+        stream.curveTo(cx + k * rx, cy + ry, cx + rx, cy + k * ry, cx + rx, cy)
+        stream.curveTo(cx + rx, cy - k * ry, cx + k * rx, cy - ry, cx, cy - ry)
+        stream.curveTo(cx - k * rx, cy - ry, cx - rx, cy - k * ry, cx - rx, cy)
+        stream.curveTo(cx - rx, cy + k * ry, cx - k * rx, cy + ry, cx, cy + ry)
+        stream.closePath()
+        stream.fill()
     }
 
     private fun drawShape(stream: PDPageContentStream, stroke: StrokeWithPoints, pageWidth: Float, pageHeight: Float, modelW: Float = MODEL_W, modelH: Float = MODEL_H) {
@@ -275,11 +406,13 @@ object PdfExporter {
         context: Context,
         ann: TextAnnotationEntity,
         pageWidth: Float,
-        pageHeight: Float
+        pageHeight: Float,
+        modelW: Float,
+        modelH: Float
     ) {
         try {
-            val ratioX = pageWidth  / MODEL_W
-            val ratioY = pageHeight / MODEL_H
+            val ratioX = pageWidth  / modelW
+            val ratioY = pageHeight / modelH
 
             val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
                 textSize = ann.fontSize * BITMAP_SCALE
@@ -319,7 +452,9 @@ object PdfExporter {
         context: Context,
         ann: ImageAnnotationEntity,
         pageWidth: Float,
-        pageHeight: Float
+        pageHeight: Float,
+        modelW: Float,
+        modelH: Float
     ) {
         try {
             val bmp = context.contentResolver.openInputStream(Uri.parse(ann.uri))?.use { input ->
@@ -327,8 +462,8 @@ object PdfExporter {
             } ?: return
 
             // Fix #1: scale model coords to PDF page dimensions.
-            val ratioX = pageWidth  / MODEL_W
-            val ratioY = pageHeight / MODEL_H
+            val ratioX = pageWidth  / modelW
+            val ratioY = pageHeight / modelH
 
             val baos = ByteArrayOutputStream()
             // Fix #4: preserve alpha channel — use PNG for images with transparency, JPEG otherwise.

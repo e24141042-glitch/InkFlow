@@ -16,7 +16,8 @@ data class DrawingPreferences(
     val recentColors: List<Int>,
     val background: PageBackground,
     val paperWidthPt: Float?,
-    val paperHeightPt: Float?
+    val paperHeightPt: Float?,
+    val quickSwipeEraserEnabled: Boolean
 )
 
 class EditorSettingsRepository(
@@ -49,7 +50,8 @@ class EditorSettingsRepository(
             recentColors = local?.recentColorsCsv?.toColorListOrNull() ?: DEFAULT_RECENT_COLORS,
             background = local?.pageBackground?.toPageBackgroundOrNull() ?: PageBackground.BLANK,
             paperWidthPt = local?.paperWidthPt,
-            paperHeightPt = local?.paperHeightPt
+            paperHeightPt = local?.paperHeightPt,
+            quickSwipeEraserEnabled = local?.quickSwipeEraserEnabled ?: false
         )
     }
 
@@ -96,6 +98,10 @@ class EditorSettingsRepository(
                 paperHeightPt = style.heightPt
             )
         }
+    }
+
+    suspend fun setQuickSwipeEraserEnabled(documentUri: String, enabled: Boolean) {
+        upsertDocument(documentUri) { copy(quickSwipeEraserEnabled = enabled) }
     }
 
     suspend fun resetDocument(documentUri: String) {

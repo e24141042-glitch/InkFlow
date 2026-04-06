@@ -148,6 +148,9 @@ class EditorViewModel(
     private val _inputMode = MutableStateFlow(InputMode.FREE)
     val inputMode: StateFlow<InputMode> = _inputMode.asStateFlow()
 
+    private val _quickSwipeEraserEnabled = MutableStateFlow(false)
+    val quickSwipeEraserEnabled: StateFlow<Boolean> = _quickSwipeEraserEnabled.asStateFlow()
+
     private val _selectedShapeSubType = MutableStateFlow(ShapeSubType.RECT)
     val selectedShapeSubType: StateFlow<ShapeSubType> = _selectedShapeSubType.asStateFlow()
 
@@ -171,6 +174,7 @@ class EditorViewModel(
                 _strokeWidth.value = strokeWidthFor(prefs.tool)
                 _selectedShapeSubType.value = prefs.shapeSubType
                 _inputMode.value = prefs.inputMode
+                _quickSwipeEraserEnabled.value = prefs.quickSwipeEraserEnabled
                 _recentColors.value = prefs.recentColors.map { Color(it) }
                 val restoredStyle = _paperStyle.value.copy(
                     background = prefs.background,
@@ -197,6 +201,13 @@ class EditorViewModel(
         _inputMode.value = next
         viewModelScope.launch(Dispatchers.IO) {
             settingsRepository.setInputMode(documentUri, next)
+        }
+    }
+
+    fun onQuickSwipeEraserEnabledChanged(enabled: Boolean) {
+        _quickSwipeEraserEnabled.value = enabled
+        viewModelScope.launch(Dispatchers.IO) {
+            settingsRepository.setQuickSwipeEraserEnabled(documentUri, enabled)
         }
     }
 
@@ -251,7 +262,11 @@ class EditorViewModel(
     }
 
     fun onToolSelected(tool: Tool) {
+        val previousTool = _selectedTool.value
         _selectedTool.value = tool
+        if (previousTool == Tool.LASSO && tool != Tool.LASSO) {
+            clearSelection(keepLastRegion = true)
+        }
         when (tool) {
             Tool.PEN -> {
                 _selectedColor.value = penColor
@@ -384,7 +399,7 @@ class EditorViewModel(
                 val command = DrawCommand.RemoveStrokes(intersectingStrokes)
                 withContext(Dispatchers.Main) { pushUndo(command) }
             }
-            // Also erase text and image annotations whose model coords fall within the eraser bounds.
+            // Also erase text annotations whose model coords fall within the eraser bounds.
             var eMinX = Float.POSITIVE_INFINITY
             var eMinY = Float.POSITIVE_INFINITY
             var eMaxX = Float.NEGATIVE_INFINITY
@@ -416,16 +431,6 @@ class EditorViewModel(
             hitTexts.forEach { ann ->
                 withContext(Dispatchers.IO) { textAnnotationDao.deleteById(ann.id) }
                 withContext(Dispatchers.Main) { pushUndo(DrawCommand.RemoveTextAnnotation(ann)) }
-            }
-            val hitImages = currentImageAnnotations.value.filter { ann ->
-                android.graphics.RectF.intersects(
-                    eraserBounds,
-                    android.graphics.RectF(ann.modelX, ann.modelY, ann.modelX + ann.modelWidth, ann.modelY + ann.modelHeight)
-                )
-            }
-            hitImages.forEach { ann ->
-                withContext(Dispatchers.IO) { imageAnnotationDao.deleteById(ann.id) }
-                withContext(Dispatchers.Main) { pushUndo(DrawCommand.RemoveImageAnnotation(ann)) }
             }
         }
     }
@@ -540,32 +545,58 @@ class EditorViewModel(
         }
     }
 
-    /** Places an image at the center of the model canvas (used when picked via gallery). Returns the new annotation ID. */
-    fun placeImageAnnotation(uri: String, imagePixelWidth: Int = 0, imagePixelHeight: Int = 0): String {
-        // Compute initial model-space dimensions that respect the image's original aspect ratio.
-        val (initW, initH) = if (imagePixelWidth > 0 && imagePixelHeight > 0) {
+    private fun computeInitialImageSize(imagePixelWidth: Int, imagePixelHeight: Int): Pair<Float, Float> {
+        return if (imagePixelWidth > 0 && imagePixelHeight > 0) {
             val aspectRatio = imagePixelHeight.toFloat() / imagePixelWidth.toFloat()
             var w = modelWidth * 0.8f
             var h = w * aspectRatio
-            // If a tall image would overflow the page height, clamp to 90 % of page height instead.
             if (h > modelHeight * 0.9f) {
                 h = modelHeight * 0.9f
                 w = h / aspectRatio
             }
             Pair(w, h)
         } else {
-            // Fallback: original fixed dimensions (backward-compatible with old call sites).
             Pair(modelWidth * 0.8f, modelHeight * 0.5f)
         }
-        val ann = ImageAnnotationEntity(
+    }
+
+    private fun buildPlacedImageAnnotation(
+        uri: String,
+        targetPageIndex: Int,
+        imagePixelWidth: Int,
+        imagePixelHeight: Int
+    ): ImageAnnotationEntity {
+        val (initW, initH) = computeInitialImageSize(imagePixelWidth, imagePixelHeight)
+        return ImageAnnotationEntity(
             documentUri = documentUri,
-            pageIndex = pageIndex.value,
+            pageIndex = targetPageIndex,
             uri = uri,
             modelX = modelWidth * 0.1f,
             modelY = modelHeight * 0.1f,
             modelWidth = initW,
             modelHeight = initH
         )
+    }
+
+    suspend fun placeImageAnnotationOnPage(
+        uri: String,
+        targetPageIndex: Int,
+        imagePixelWidth: Int = 0,
+        imagePixelHeight: Int = 0
+    ): String {
+        val ann = buildPlacedImageAnnotation(uri, targetPageIndex, imagePixelWidth, imagePixelHeight)
+        withContext(Dispatchers.IO) {
+            imageAnnotationDao.insert(ann)
+        }
+        withContext(Dispatchers.Main) {
+            pushUndo(DrawCommand.AddImageAnnotation(ann))
+        }
+        return ann.id
+    }
+
+    /** Places an image at the center of the model canvas (used when picked via gallery). Returns the new annotation ID. */
+    fun placeImageAnnotation(uri: String, imagePixelWidth: Int = 0, imagePixelHeight: Int = 0): String {
+        val ann = buildPlacedImageAnnotation(uri, pageIndex.value, imagePixelWidth, imagePixelHeight)
         viewModelScope.launch(Dispatchers.IO) {
             imageAnnotationDao.insert(ann)
             withContext(Dispatchers.Main) { pushUndo(DrawCommand.AddImageAnnotation(ann)) }
@@ -667,6 +698,41 @@ class EditorViewModel(
                 is DrawCommand.ResizeImageAnnotation -> {
                     imageAnnotationDao.update(command.original)
                 }
+                is DrawCommand.MoveSelectionMixed -> {
+                    command.strokeOriginals.forEach { swp ->
+                        db.withTransaction {
+                            strokeDao.deletePointsForStroke(swp.stroke.id)
+                            strokeDao.insertStroke(swp.stroke)
+                            strokeDao.insertPoints(swp.points)
+                        }
+                    }
+                    command.imageOriginals.forEach { imageAnnotationDao.update(it) }
+                }
+                is DrawCommand.ResizeSelectionMixed -> {
+                    command.strokeOriginals.forEach { swp ->
+                        db.withTransaction {
+                            strokeDao.deletePointsForStroke(swp.stroke.id)
+                            strokeDao.insertStroke(swp.stroke)
+                            strokeDao.insertPoints(swp.points)
+                        }
+                    }
+                    command.imageOriginals.forEach { imageAnnotationDao.update(it) }
+                }
+                is DrawCommand.AddSelectionCopies -> {
+                    if (command.strokes.isNotEmpty()) {
+                        strokeDao.deleteStrokesByIds(command.strokes.map { it.stroke.id })
+                    }
+                    command.images.forEach { imageAnnotationDao.deleteById(it.id) }
+                }
+                is DrawCommand.RemoveSelectionMixed -> {
+                    command.strokes.forEach { strokeWithPoints ->
+                        db.withTransaction {
+                            strokeDao.insertStroke(strokeWithPoints.stroke)
+                            strokeDao.insertPoints(strokeWithPoints.points)
+                        }
+                    }
+                    command.images.forEach { imageAnnotationDao.insert(it) }
+                }
             }
             withContext(Dispatchers.Main) {
                 redoStack.addLast(command)
@@ -740,6 +806,41 @@ class EditorViewModel(
                 is DrawCommand.ResizeImageAnnotation -> {
                     imageAnnotationDao.update(command.updated)
                 }
+                is DrawCommand.MoveSelectionMixed -> {
+                    command.strokeUpdated.forEach { swp ->
+                        db.withTransaction {
+                            strokeDao.deletePointsForStroke(swp.stroke.id)
+                            strokeDao.insertStroke(swp.stroke)
+                            strokeDao.insertPoints(swp.points)
+                        }
+                    }
+                    command.imageUpdated.forEach { imageAnnotationDao.update(it) }
+                }
+                is DrawCommand.ResizeSelectionMixed -> {
+                    command.strokeUpdated.forEach { swp ->
+                        db.withTransaction {
+                            strokeDao.deletePointsForStroke(swp.stroke.id)
+                            strokeDao.insertStroke(swp.stroke)
+                            strokeDao.insertPoints(swp.points)
+                        }
+                    }
+                    command.imageUpdated.forEach { imageAnnotationDao.update(it) }
+                }
+                is DrawCommand.AddSelectionCopies -> {
+                    command.strokes.forEach { strokeWithPoints ->
+                        db.withTransaction {
+                            strokeDao.insertStroke(strokeWithPoints.stroke)
+                            strokeDao.insertPoints(strokeWithPoints.points)
+                        }
+                    }
+                    command.images.forEach { imageAnnotationDao.insert(it) }
+                }
+                is DrawCommand.RemoveSelectionMixed -> {
+                    if (command.strokes.isNotEmpty()) {
+                        strokeDao.deleteStrokesByIds(command.strokes.map { it.stroke.id })
+                    }
+                    command.images.forEach { imageAnnotationDao.deleteById(it.id) }
+                }
             }
             withContext(Dispatchers.Main) {
                 undoStack.addLast(command)
@@ -753,11 +854,20 @@ class EditorViewModel(
     private val _selectedStrokes = MutableStateFlow<List<StrokeWithPoints>>(emptyList())
     val selectedStrokes: StateFlow<List<StrokeWithPoints>> = _selectedStrokes.asStateFlow()
 
+    private val _selectedImageAnnotationIds = MutableStateFlow<Set<String>>(emptySet())
+    val selectedImageAnnotationIds: StateFlow<Set<String>> = _selectedImageAnnotationIds.asStateFlow()
+
     private val _selectedStrokePreview = MutableStateFlow<List<StrokeWithPoints>>(emptyList())
     val selectedStrokePreview: StateFlow<List<StrokeWithPoints>> = _selectedStrokePreview.asStateFlow()
 
     private val _lassoPolygon = MutableStateFlow<List<Offset>>(emptyList())
     val lassoPolygon: StateFlow<List<Offset>> = _lassoPolygon.asStateFlow()
+
+    private val _selectionFramePolygon = MutableStateFlow<List<Offset>>(emptyList())
+    val selectionFramePolygon: StateFlow<List<Offset>> = _selectionFramePolygon.asStateFlow()
+
+    private val _lastLassoPolygon = MutableStateFlow<List<Offset>>(emptyList())
+    val lastLassoPolygon: StateFlow<List<Offset>> = _lastLassoPolygon.asStateFlow()
 
     private val _lassoMoveOffset = MutableStateFlow(Offset.Zero)
     val lassoMoveOffset: StateFlow<Offset> = _lassoMoveOffset.asStateFlow()
@@ -797,24 +907,39 @@ class EditorViewModel(
         }
     }
 
+    private fun transformPolygon(
+        polygon: List<Offset>,
+        translation: Offset,
+        scale: Float,
+        anchor: Offset
+    ): List<Offset> {
+        val clampedScale = StrokeTransformUtils.clampUniformScale(scale)
+        return polygon.map { point ->
+            val anchoredX = point.x - anchor.x
+            val anchoredY = point.y - anchor.y
+            Offset(
+                x = anchor.x + anchoredX * clampedScale + translation.x,
+                y = anchor.y + anchoredY * clampedScale + translation.y
+            )
+        }
+    }
+
+    private fun currentSelectionAnchor(originals: List<StrokeWithPoints>): Offset {
+        return _selectedStrokeResizeAnchor.value
+            ?: StrokeTransformUtils.computeSelectionBounds(originals)?.center
+            ?: Offset.Zero
+    }
+
     private fun refreshSelectedStrokePreview() {
         val originals = _selectedStrokes.value
         if (originals.isEmpty()) {
             _selectedStrokePreview.value = emptyList()
             _selectedStrokePreviewBounds.value = null
+            _selectionFramePolygon.value = emptyList()
             return
         }
-        val anchor = _selectedStrokeResizeAnchor.value ?: StrokeTransformUtils
-            .computeSelectionBounds(originals)
-            ?.center ?: Offset.Zero
-        val preview = StrokeTransformUtils.transformStrokes(
-            strokes = originals,
-            translation = _lassoMoveOffset.value,
-            scale = _selectedStrokeScale.value,
-            anchor = anchor
-        )
-        _selectedStrokePreview.value = preview
-        _selectedStrokePreviewBounds.value = StrokeTransformUtils.computeSelectionBounds(preview)
+        _selectedStrokePreview.value = originals
+        _selectedStrokePreviewBounds.value = StrokeTransformUtils.computeSelectionBounds(originals)
     }
 
     fun selectStrokesInLasso(polygon: List<Offset>) {
@@ -828,10 +953,16 @@ class EditorViewModel(
         // a second time would double-invert and shift the lasso at any zoom ≠ 1.
         val normalizedPolygon = polygon.map { Offset(it.x * modelWidth / cW, it.y * modelHeight / cH) }
         _lassoPolygon.value = normalizedPolygon
+        _selectionFramePolygon.value = normalizedPolygon
+        _lastLassoPolygon.value = normalizedPolygon
         viewModelScope.launch(Dispatchers.Default) {
             val selected = IntersectionUtils.findStrokesInLasso(normalizedPolygon, currentStrokes.value)
+            val selectedImages = currentImageAnnotations.value.filter { ann ->
+                isImageSelectedByLasso(ann, normalizedPolygon)
+            }
             withContext(Dispatchers.Main) {
                 _selectedStrokes.value = selected
+                _selectedImageAnnotationIds.value = selectedImages.map { it.id }.toSet()
                 _lassoMoveOffset.value = Offset.Zero
                 _selectedStrokeScale.value = 1f
                 _selectedStrokeResizeAnchor.value = null
@@ -841,7 +972,54 @@ class EditorViewModel(
         }
     }
 
+    private fun isPointInPolygon(point: Offset, polygon: List<Offset>): Boolean {
+        if (polygon.size < 3) return false
+        var inside = false
+        var j = polygon.lastIndex
+        for (i in polygon.indices) {
+            val xi = polygon[i].x
+            val yi = polygon[i].y
+            val xj = polygon[j].x
+            val yj = polygon[j].y
+            val intersects = ((yi > point.y) != (yj > point.y)) &&
+                (point.x < (xj - xi) * (point.y - yi) / (yj - yi) + xi)
+            if (intersects) inside = !inside
+            j = i
+        }
+        return inside
+    }
+
+    private fun isImageSelectedByLasso(annotation: ImageAnnotationEntity, polygon: List<Offset>): Boolean {
+        if (polygon.size < 3) return false
+
+        val imageRect = android.graphics.RectF(
+            annotation.modelX,
+            annotation.modelY,
+            annotation.modelX + annotation.modelWidth,
+            annotation.modelY + annotation.modelHeight
+        )
+        val minX = polygon.minOf { it.x }
+        val minY = polygon.minOf { it.y }
+        val maxX = polygon.maxOf { it.x }
+        val maxY = polygon.maxOf { it.y }
+        val polygonBounds = android.graphics.RectF(minX, minY, maxX, maxY)
+        if (!android.graphics.RectF.intersects(imageRect, polygonBounds)) return false
+
+        val samplePoints = listOf(
+            Offset(imageRect.left, imageRect.top),
+            Offset(imageRect.right, imageRect.top),
+            Offset(imageRect.left, imageRect.bottom),
+            Offset(imageRect.right, imageRect.bottom),
+            Offset(imageRect.centerX(), imageRect.centerY())
+        )
+
+        if (samplePoints.any { isPointInPolygon(it, polygon) }) return true
+
+        return polygon.any { p -> p.x in imageRect.left..imageRect.right && p.y in imageRect.top..imageRect.bottom }
+    }
+
     fun moveSelectedStrokes(delta: Offset) {
+        if (delta == Offset.Zero) return
         // Normalise drag delta to model space so it lines up with stored stroke coordinates.
         val normalizedDelta = Offset(delta.x * modelWidth / canvasW, delta.y * modelHeight / canvasH)
         _lassoMoveOffset.value = _lassoMoveOffset.value + normalizedDelta
@@ -861,72 +1039,213 @@ class EditorViewModel(
 
     fun commitMovedStrokes() {
         val strokes = _selectedStrokes.value
+        val images = selectedImagesSnapshot()
         val delta = _lassoMoveOffset.value
-        if (strokes.isEmpty() || (delta.x == 0f && delta.y == 0f)) {
+        if ((strokes.isEmpty() && images.isEmpty()) || (delta.x == 0f && delta.y == 0f)) {
             clearSelection()
             return
         }
 
-        val movedStrokes = _selectedStrokePreview.value.ifEmpty {
+        val movedStrokes = if (strokes.isNotEmpty()) {
             StrokeTransformUtils.transformStrokes(strokes, translation = delta)
+        } else {
+            emptyList()
+        }
+        val movedImages = images.map { ann ->
+            ann.copy(
+                modelX = ann.modelX + delta.x,
+                modelY = ann.modelY + delta.y
+            )
         }
 
         // Apply new DB state but keep the selection active for further edits.
         _selectedStrokes.value = movedStrokes
+        _selectedStrokePreview.value = movedStrokes
         _lassoMoveOffset.value = Offset.Zero
         _selectedStrokeScale.value = 1f
         _selectedStrokeResizeAnchor.value = null
-        _lassoPolygon.value = emptyList() // Clear the lasso rope, allow standard bounding box interaction
+        val committedSelectionPolygon = transformPolygon(
+            polygon = _lassoPolygon.value,
+            translation = delta,
+            scale = 1f,
+            anchor = Offset.Zero
+        ).ifEmpty { _lassoPolygon.value }
+        _lassoPolygon.value = committedSelectionPolygon
+        _selectionFramePolygon.value = committedSelectionPolygon
+        _lastLassoPolygon.value = committedSelectionPolygon
         _selectedStrokePreviewBounds.value = StrokeTransformUtils.computeSelectionBounds(movedStrokes)
 
-        _commitPreview.value = movedStrokes
+        _commitPreview.value = movedStrokes.takeIf { it.isNotEmpty() }
 
         viewModelScope.launch(Dispatchers.IO) {
-            replaceStrokeSnapshots(movedStrokes)
-            val command = DrawCommand.MoveStrokes(strokes, delta)
+            if (movedStrokes.isNotEmpty()) {
+                replaceStrokeSnapshots(movedStrokes)
+            }
+            movedImages.forEach { imageAnnotationDao.update(it) }
             withContext(Dispatchers.Main) {
                 if (_commitPreview.value === movedStrokes) {
                     _commitPreview.value = null
                 }
-                pushUndo(command)
+                when {
+                    images.isEmpty() -> pushUndo(DrawCommand.MoveStrokes(strokes, delta))
+                    else -> pushUndo(
+                        DrawCommand.MoveSelectionMixed(
+                            strokeOriginals = strokes,
+                            strokeUpdated = movedStrokes,
+                            imageOriginals = images,
+                            imageUpdated = movedImages
+                        )
+                    )
+                }
             }
         }
     }
 
     fun commitResizedStrokes() {
         val originals = _selectedStrokes.value
+        val images = selectedImagesSnapshot()
+        val translation = _lassoMoveOffset.value
         val scale = _selectedStrokeScale.value
-        if (originals.isEmpty() || kotlin.math.abs(scale - 1f) < 0.001f) {
+        if ((originals.isEmpty() && images.isEmpty()) || (kotlin.math.abs(scale - 1f) < 0.001f && translation == Offset.Zero)) {
             clearSelection()
             return
         }
 
-        val updated = _selectedStrokePreview.value.ifEmpty { originals }
+        val anchor = currentSelectionAnchor(originals)
+        val updated = if (originals.isNotEmpty()) {
+            StrokeTransformUtils.transformStrokes(
+                strokes = originals,
+                translation = translation,
+                scale = scale,
+                anchor = anchor
+            )
+        } else {
+            emptyList()
+        }
+        val clampedScale = StrokeTransformUtils.clampUniformScale(scale)
+        val updatedImages = images.map { ann ->
+            ann.copy(
+                modelX = anchor.x + (ann.modelX - anchor.x) * clampedScale + translation.x,
+                modelY = anchor.y + (ann.modelY - anchor.y) * clampedScale + translation.y,
+                modelWidth = (ann.modelWidth * clampedScale).coerceAtLeast(30f),
+                modelHeight = (ann.modelHeight * clampedScale).coerceAtLeast(30f)
+            )
+        }
 
         // Keep selection active
         _selectedStrokes.value = updated
+        _selectedStrokePreview.value = updated
+        _lassoMoveOffset.value = Offset.Zero
         _selectedStrokeScale.value = 1f
         _selectedStrokeResizeAnchor.value = null
+        val committedSelectionPolygon = transformPolygon(
+            polygon = _lassoPolygon.value,
+            translation = translation,
+            scale = scale,
+            anchor = anchor
+        ).ifEmpty { _lassoPolygon.value }
+        _lassoPolygon.value = committedSelectionPolygon
+        _selectionFramePolygon.value = committedSelectionPolygon
+        _lastLassoPolygon.value = committedSelectionPolygon
         _selectedStrokePreviewBounds.value = StrokeTransformUtils.computeSelectionBounds(updated)
 
-        _commitPreview.value = updated
+        _commitPreview.value = updated.takeIf { it.isNotEmpty() }
         viewModelScope.launch(Dispatchers.IO) {
-            replaceStrokeSnapshots(updated)
+            if (updated.isNotEmpty()) {
+                replaceStrokeSnapshots(updated)
+            }
+            updatedImages.forEach { imageAnnotationDao.update(it) }
             withContext(Dispatchers.Main) {
                 if (_commitPreview.value === updated) {
                     _commitPreview.value = null
                 }
-                pushUndo(DrawCommand.ResizeStrokes(originals, updated))
+                when {
+                    images.isEmpty() -> pushUndo(DrawCommand.ResizeStrokes(originals, updated))
+                    else -> pushUndo(
+                        DrawCommand.ResizeSelectionMixed(
+                            strokeOriginals = originals,
+                            strokeUpdated = updated,
+                            imageOriginals = images,
+                            imageUpdated = updatedImages
+                        )
+                    )
+                }
             }
         }
     }
 
-    fun clearSelection() {
+    private fun selectedImagesSnapshot(): List<ImageAnnotationEntity> {
+        val ids = _selectedImageAnnotationIds.value
+        if (ids.isEmpty()) return emptyList()
+        return currentImageAnnotations.value.filter { it.id in ids }
+    }
+
+    fun deleteSelection() {
+        val selectedStrokeSnapshots = _selectedStrokes.value
+        val selectedImageSnapshots = selectedImagesSnapshot()
+        if (selectedStrokeSnapshots.isEmpty() && selectedImageSnapshots.isEmpty()) return
+
+        viewModelScope.launch(Dispatchers.IO) {
+            if (selectedStrokeSnapshots.isNotEmpty()) {
+                strokeDao.deleteStrokesByIds(selectedStrokeSnapshots.map { it.stroke.id })
+            }
+            selectedImageSnapshots.forEach { imageAnnotationDao.deleteById(it.id) }
+            withContext(Dispatchers.Main) {
+                clearSelection(keepLastRegion = true)
+                pushUndo(DrawCommand.RemoveSelectionMixed(selectedStrokeSnapshots, selectedImageSnapshots))
+            }
+        }
+    }
+
+    fun copySelectionInPlace() {
+        val sourceStrokes = _selectedStrokes.value
+        val sourceImages = selectedImagesSnapshot()
+        if (sourceStrokes.isEmpty() && sourceImages.isEmpty()) return
+
+        viewModelScope.launch(Dispatchers.IO) {
+            val copiedStrokes = sourceStrokes.map { original ->
+                val newStrokeId = UUID.randomUUID().toString()
+                val copiedStroke = original.stroke.copy(id = newStrokeId)
+                val copiedPoints = original.points.map { pt ->
+                    pt.copy(id = 0, strokeId = newStrokeId)
+                }
+                db.withTransaction {
+                    strokeDao.insertStroke(copiedStroke)
+                    strokeDao.insertPoints(copiedPoints)
+                }
+                StrokeWithPoints(copiedStroke, copiedPoints)
+            }
+
+            val copiedImages = sourceImages.map { original ->
+                val copied = original.copy(id = UUID.randomUUID().toString())
+                imageAnnotationDao.insert(copied)
+                copied
+            }
+
+            withContext(Dispatchers.Main) {
+                _selectedStrokes.value = copiedStrokes
+                _selectedStrokePreview.value = copiedStrokes
+                _selectedStrokePreviewBounds.value = StrokeTransformUtils.computeSelectionBounds(copiedStrokes)
+                _selectedStrokeScale.value = 1f
+                _selectedStrokeResizeAnchor.value = null
+                _lassoMoveOffset.value = Offset.Zero
+                _selectedImageAnnotationIds.value = copiedImages.map { it.id }.toSet()
+                pushUndo(DrawCommand.AddSelectionCopies(copiedStrokes, copiedImages))
+            }
+        }
+    }
+
+    fun clearSelection(keepLastRegion: Boolean = false) {
         _selectedStrokes.value = emptyList()
+        _selectedImageAnnotationIds.value = emptySet()
         _selectedStrokePreview.value = emptyList()
         _selectedStrokePreviewBounds.value = null
+        _selectionFramePolygon.value = emptyList()
         _selectedStrokeScale.value = 1f
         _selectedStrokeResizeAnchor.value = null
+        if (!keepLastRegion) {
+            _lastLassoPolygon.value = emptyList()
+        }
         _lassoPolygon.value = emptyList()
         _lassoMoveOffset.value = Offset.Zero
         _commitPreview.value = null
@@ -938,7 +1257,7 @@ class EditorViewModel(
         targetPageIndex: Int,
         pdfPageBitmap: android.graphics.Bitmap?
     ) {
-        val polygon = _lassoPolygon.value
+        val polygon = _lassoPolygon.value.ifEmpty { _lastLassoPolygon.value }
         if (polygon.isEmpty()) return
 
         if (!extractionMutex.tryLock()) return
@@ -1138,7 +1457,7 @@ class EditorViewModel(
         sourcePageIndex: Int,
         pdfPageBitmap: android.graphics.Bitmap?
     ): java.io.File? {
-        val polygon = _lassoPolygon.value
+        val polygon = _lassoPolygon.value.ifEmpty { _lastLassoPolygon.value }
         if (polygon.isEmpty()) return null
 
         if (!extractionMutex.tryLock()) return null

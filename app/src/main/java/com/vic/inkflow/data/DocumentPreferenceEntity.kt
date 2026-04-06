@@ -20,5 +20,6 @@ data class DocumentPreferenceEntity(
     val highlighterColorArgb: Int? = null,
     val pageBackground: String? = null,
     val paperWidthPt: Float? = null,
-    val paperHeightPt: Float? = null
+    val paperHeightPt: Float? = null,
+    val quickSwipeEraserEnabled: Boolean? = null
 )

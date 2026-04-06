@@ -18,5 +18,19 @@ sealed class DrawCommand {
     data class RemoveImageAnnotation(val annotation: ImageAnnotationEntity) : DrawCommand()
     data class MoveImageAnnotation(val original: ImageAnnotationEntity, val updated: ImageAnnotationEntity) : DrawCommand()
     data class ResizeImageAnnotation(val original: ImageAnnotationEntity, val updated: ImageAnnotationEntity) : DrawCommand()
+    data class MoveSelectionMixed(
+        val strokeOriginals: List<StrokeWithPoints>,
+        val strokeUpdated: List<StrokeWithPoints>,
+        val imageOriginals: List<ImageAnnotationEntity>,
+        val imageUpdated: List<ImageAnnotationEntity>
+    ) : DrawCommand()
+    data class ResizeSelectionMixed(
+        val strokeOriginals: List<StrokeWithPoints>,
+        val strokeUpdated: List<StrokeWithPoints>,
+        val imageOriginals: List<ImageAnnotationEntity>,
+        val imageUpdated: List<ImageAnnotationEntity>
+    ) : DrawCommand()
+    data class AddSelectionCopies(val strokes: List<StrokeWithPoints>, val images: List<ImageAnnotationEntity>) : DrawCommand()
+    data class RemoveSelectionMixed(val strokes: List<StrokeWithPoints>, val images: List<ImageAnnotationEntity>) : DrawCommand()
 }
 
